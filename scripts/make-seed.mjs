@@ -8,7 +8,7 @@ import { loadConfig } from '../bridge/config.mjs';
 
 const { ck } = loadConfig();
 const d = Buffer.from(crypto.createPrivateKey(fs.readFileSync(ck.pemPath)).export({ format: 'jwk' }).d, 'base64url').toString('hex');
-const seed = JSON.stringify({ container: ck.container, environment: ck.environment, keyId: ck.keyId, d });
+const seed = JSON.stringify({ container: ck.container, environment: ck.environment, keyId: ck.keyId, d, k: ck.dataKey });
 console.log(`seed: container ${ck.container} (${ck.environment}), key ${ck.keyId.slice(0, 8)}…, d ${d.length} hex chars`);
 if (process.argv.includes('--store')) {
   const repo = process.argv[process.argv.indexOf('--store') + 1] || 'theprojectmaker/postline-ios';

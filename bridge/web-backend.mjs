@@ -21,10 +21,13 @@ export async function makeWebBackend(cfg, log = console.log) {
     channel: 'chrome', headless: cfg.headless !== false, viewport: { width: 1400, height: 1000 }, args: ['--disable-background-mode'],
     ...(cfg.chromePath ? { executablePath: cfg.chromePath, channel: undefined } : {}),
   });
-  const page = ctx.pages()[0] || await ctx.newPage();
+  let page = ctx.pages()[0] || await ctx.newPage();
   page.setDefaultTimeout(20000);
   let queue = Promise.resolve();
-  const run = (fn) => { const p = queue.then(fn, fn); queue = p.catch(() => {}); return p; }; // one thing at a time on the one page
+  async function fresh() { try { await page.close(); } catch { /* gone */ } page = await ctx.newPage(); page.setDefaultTimeout(20000); }
+  const crashed = (e) => /crash|closed|Target page|Navigation failed/i.test(String(e && e.message));
+  // one thing at a time on the one page; a crashed tab is replaced and the step retried once
+  const run = (fn) => { const step = async () => { try { return await fn(); } catch (e) { if (!crashed(e)) throw e; log('page crashed, opening a fresh tab'); await fresh(); return fn(); } }; const p = queue.then(step, step); queue = p.catch(() => {}); return p; };
   const shot = async (n) => { try { await page.screenshot({ path: path.join(here, `last-${n}.png`) }); } catch { /* ignore */ } };
 
   async function go(hash, waitFor = 'tr.zA, div.nH.h7, .a3s, div[role="main"]') {
@@ -35,10 +38,17 @@ export async function makeWebBackend(cfg, log = console.log) {
     await sleep(600);
   }
 
+  // the list DOM is reused between views: wait until the tab title says which view is showing, then let the rows settle
+  const TITLES = { inbox: /^Inbox/i, sent: /^Sent/i, starred: /^Starred/i };
+  async function waitView(slug) {
+    for (let i = 0; i < 40; i++) { if (TITLES[slug] ? TITLES[slug].test(await page.title()) : i > 6) break; await sleep(250); }
+    await sleep(1200);
+  }
+
   // ---- list rows -> summaries (also the change signature)
   const rows = new Map(); // id -> summary from the latest list view
   async function readRows(max) {
-    const raw = await page.evaluate(() => [...document.querySelectorAll('tr.zA')].map((tr) => {
+    const raw = await page.evaluate(() => [...document.querySelectorAll('tr.zA')].filter((tr) => tr.offsetParent !== null).map((tr) => {
       const idEl = tr.querySelector('[data-legacy-thread-id]');
       const nameEl = tr.querySelector('.yW span[email], .yP, .zF');
       const dateEl = tr.querySelector('td.xW span[title], td.xW span');
@@ -67,9 +77,29 @@ export async function makeWebBackend(cfg, log = console.log) {
   const BOXES = [['inbox', 'inbox', 'inbox'], ['sent', 'sent', 'sent'], ['starred', 'starred', 'star']];
   let unreadCount = 0;
 
+  // Opens a conversation by clicking its row in whichever list shows it (a direct URL does not open multi-message threads).
+  async function openThread(id) {
+    for (const slug of ['inbox', 'sent', 'starred']) {
+      await go('#' + slug);
+      await waitView(slug);
+      const row = page.locator(`tr.zA:has([data-legacy-thread-id="${id}"])`).first();
+      if (await row.count()) {
+        await row.scrollIntoViewIfNeeded().catch(() => {});
+        await row.click({ position: { x: 300, y: 12 }, timeout: 8000 });
+        return true;
+      }
+    }
+    await go('#search/' + encodeURIComponent('rfc822msgid:' + id)).catch(() => {});
+    return false;
+  }
+
   // ---- one conversation
   async function readThread(id) {
-    await go(`#all/${id}`, 'h2.hP, .a3s');
+    const sigOf = () => page.evaluate(() => { const v = (e) => e.offsetParent !== null; const h = [...document.querySelectorAll('h2.hP')].find(v); const b = [...document.querySelectorAll('.a3s')].find(v); return (h ? h.innerText : '') + '|' + (b ? b.innerText.slice(0, 60) : '') + '|' + document.querySelectorAll('div.adn').length; });
+    const before = await sigOf().catch(() => '');
+    if (!(await openThread(id))) throw new Error('Thread not found');
+    for (let i = 0; i < 24; i++) { const now = await sigOf().catch(() => ''); if (now !== before && /|/.test(now) && now.split('|')[0]) break; await sleep(250); } // wait for THIS thread to replace the previous one
+    await sleep(400);
     // open every collapsed message
     for (let i = 0; i < 3; i++) {
       const btn = page.locator('[aria-label="Expand all"], span.aJ6, div.kQ, div.kv').first();
@@ -78,8 +108,9 @@ export async function makeWebBackend(cfg, log = console.log) {
     }
     const me = await accountEmail();
     const data = await page.evaluate(() => {
-      const subject = (document.querySelector('h2.hP') || {}).innerText || '';
-      const msgs = [...document.querySelectorAll('div.adn[data-message-id], div.gs')].filter((e) => e.querySelector('.a3s')).map((e) => {
+      const v = (e) => e.offsetParent !== null;
+      const subject = ([...document.querySelectorAll('h2.hP')].find(v) || {}).innerText || '';
+      const msgs = [...document.querySelectorAll('div.adn[data-message-id]')].filter((e) => v(e) && e.querySelector('.a3s')).map((e) => {
         const body = e.querySelector('.a3s.aiL, .a3s');
         const from = e.querySelector('.gD');
         const to = [...e.querySelectorAll('.g2[email], .hb span[email]')].map((x) => x.getAttribute('email'));
@@ -104,6 +135,25 @@ export async function makeWebBackend(cfg, log = console.log) {
   const account = await accountEmail();
   log(`web backend ready (${account || 'account unknown'})`);
 
+  // Finds the row for a thread in whichever list shows it (the toolbar in an opened conversation is not usable headless;
+  // the list toolbar, which appears once a row is ticked, is).
+  async function rowFor(id) {
+    for (const slug of ['inbox', 'sent', 'starred']) {
+      await go('#' + slug); await waitView(slug);
+      const row = page.locator(`tr.zA:has([data-legacy-thread-id="${id}"])`).first();
+      if (await row.count()) { await row.scrollIntoViewIfNeeded().catch(() => {}); return row; }
+    }
+    throw new Error('Thread not found');
+  }
+  async function listAction(id, label) {
+    const row = await rowFor(id);
+    await row.locator('div[role="checkbox"]').first().click({ timeout: 8000 });
+    await sleep(500);
+    const btn = page.locator(`div[role="button"][aria-label="${label}"]:visible`).first();
+    if (label === 'Archive' && !(await btn.count())) { await row.locator('div[role="checkbox"]').first().click().catch(() => {}); return; } // not in the inbox: already archived
+    await btn.click({ timeout: 8000 });
+    await sleep(900);
+  }
   const toolbar = async (label, { confirm } = {}) => {
     const b = page.locator(`div[role="button"][aria-label="${label}"], div[role="button"][data-tooltip="${label}"]`).first();
     await b.click({ timeout: 8000 });
@@ -136,10 +186,11 @@ export async function makeWebBackend(cfg, log = console.log) {
       const ids = new Map();
       for (const [slug, , flag] of BOXES) {
         await go('#' + slug);
+        await waitView(slug);
         const max = Math.min(50, slug === 'inbox' ? cfg.inboxMax : slug === 'sent' ? cfg.sentMax : cfg.starMax);
         const rs = await readRows(max);
         if (slug === 'inbox') unreadCount = rs.filter((r) => r.unread).length;
-        for (const r of rs) { const s = rowToSummary(r, flag); const prev = rows.get(r.id); if (prev && !s.flags.includes(prev.flags[0])) s.flags.push(prev.flags[0]); rows.set(r.id, s); if (!ids.has(r.id)) ids.set(r.id, s.h); }
+        for (const r of rs) { const s = rowToSummary(r, flag); const prev = rows.get(r.id); if (prev && !s.flags.includes(prev.flags[0])) s.flags.push(prev.flags[0]); s.flags = [...new Set(s.flags)]; rows.set(r.id, s); if (!ids.has(r.id)) ids.set(r.id, s.h); }
       }
       return ids;
     }),
@@ -156,17 +207,19 @@ export async function makeWebBackend(cfg, log = console.log) {
       return { summary, detail: { id, h: summary.h, subject: summary.subject, msgs, flags: summary.flags } };
     }),
     unread: async () => unreadCount,
-    mark: (id, read) => run(async () => { await go(`#all/${id}`, 'h2.hP'); if (!read) { await toolbar('Mark as unread'); } }),
-    archive: (id) => run(async () => { await go(`#all/${id}`, 'h2.hP'); await toolbar('Archive'); }),
-    trash: (id) => run(async () => { await go(`#all/${id}`, 'h2.hP'); await toolbar('Delete'); }),
+    summaryOf: (id) => rows.get(id),
+    mark: (id, read) => run(async () => { if (read) return; await listAction(id, 'Mark as unread'); }),
+    archive: (id) => run(() => listAction(id, 'Archive')),
+    trash: (id) => run(() => listAction(id, 'Delete')),
     star: (id, on) => run(async () => {
-      await go(`#all/${id}`, 'h2.hP');
-      const star = page.locator(on ? '[aria-label="Not starred"]' : '[aria-label="Starred"]').first();
-      await star.click({ timeout: 8000 }).catch(() => {});
+      const row = await rowFor(id);
+      const star = row.locator('span.aXw').first();
+      const isOn = (await star.getAttribute('aria-label').catch(() => '')) === 'Starred';
+      if (isOn !== !!on) { await star.click({ timeout: 8000 }); await sleep(800); }
     }),
     send: (op) => run(async () => {
       if (op.threadId) {
-        await go(`#all/${op.threadId}`, 'h2.hP');
+        await openThread(op.threadId); await page.waitForSelector('h2.hP', { timeout: 15000 });
         const all = !!(op.cc && String(op.cc).trim());
         await page.locator(all ? 'span[role="link"][aria-label*="Reply all"], div[aria-label="Reply all"], [data-tooltip="Reply all"]' : 'span[role="link"]:has-text("Reply"), div[aria-label="Reply"], [data-tooltip="Reply"]').last().click({ timeout: 10000 });
         const box = page.locator('div[aria-label="Message Body"], div[role="textbox"][g_editable="true"]').last();
@@ -184,6 +237,8 @@ export async function makeWebBackend(cfg, log = console.log) {
     }),
     search: (q) => run(async () => {
       await go('#search/' + encodeURIComponent(q));
+      for (let i = 0; i < 40 && !/search/i.test(await page.title()); i++) await sleep(250);
+      await sleep(1500);
       return (await readRows(25)).map((r) => rowToSummary(r, 'all'));
     }),
     close: () => ctx.close(),

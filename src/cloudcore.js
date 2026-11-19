@@ -9,14 +9,14 @@
 //   pl-t-<threadId> one conversation with message bodies, gzip+base64 (single record, bodies trimmed to fit)
 //   pl-s-<opId>     a search result (same shape as the list)
 //   pl-inbox        the app's requests {ops:[{id,t,ts,...}]} written with compare-and-swap
-import { gunzipSync, strFromU8 } from 'fflate';
-import { base64ToBytes, signedHeaders } from './cksign.js';
+import { signedHeaders } from './cksign.js';
+import { seal, unseal } from './seal.js';
 
 const HOST = 'https://api.apple-cloudkit.com';
 export const TYPE = 'LibraryMeta';
 let skewMs = 0;
 
-export const canUse = (cfg) => !!(cfg && cfg.container && cfg.keyId && cfg.d);
+export const canUse = (cfg) => !!(cfg && cfg.container && cfg.keyId && cfg.d && cfg.k);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function call(cfg, op, payload, ms = 25000) {
@@ -60,13 +60,12 @@ export async function lookup(cfg, names, ms = 25000) {
   return (await callRetry(cfg, 'records/lookup', { records: names.map((recordName) => ({ recordName })) }, ms)).records || [];
 }
 const modify = async (cfg, operations, ms = 30000) => (await callRetry(cfg, 'records/modify', { operations }, ms)).records || [];
-const jsonOf = (rec) => { try { return rec && rec.fields && rec.fields.json ? JSON.parse(rec.fields.json.value) : null; } catch { return null; } };
-const unpack = (b64) => JSON.parse(strFromU8(gunzipSync(base64ToBytes(b64))));
+const jsonOf = (cfg, rec) => { try { return rec && rec.fields && rec.fields.json ? unseal(cfg.k, rec.fields.json.value) : null; } catch { return null; } };
 
 /** The bridge's status record. null = not published yet. Throws when iCloud cannot be reached. */
 export async function readState(cfg, ms = 12000) {
   const [rec] = await lookup(cfg, ['pl-state'], ms);
-  return jsonOf(rec);
+  return jsonOf(cfg, rec);
 }
 
 /** The thread list for a version: [{id,subject,from,snippet,date,unread,n,labels,...}]. */
@@ -85,14 +84,20 @@ export async function readList(cfg, prefix, parts) {
       ver = v; pieces.push(r.fields.json.value);
     }
   }
-  return { items: unpack(pieces.join('')), ver };
+  return { items: unseal(cfg.k, pieces.join('')), ver };
 }
 
 /** One conversation (or null when the bridge has not written it yet). */
 export async function readThread(cfg, id) {
   const [rec] = await lookup(cfg, [`pl-t-${id}`], 30000);
   if (!rec || !rec.fields || !rec.fields.json) return null;
-  return { ...unpack(rec.fields.json.value), _ver: Number(rec.fields.updatedAt && rec.fields.updatedAt.value) || 0 };
+  return { ...unseal(cfg.k, rec.fields.json.value), _ver: Number(rec.fields.updatedAt && rec.fields.updatedAt.value) || 0 };
+}
+
+/** A Gmail search result the bridge wrote for request `id` (null until it exists). */
+export async function readSearch(cfg, id) {
+  const [rec] = await lookup(cfg, [`pl-s-${id}`], 30000);
+  return rec && rec.fields && rec.fields.json ? unseal(cfg.k, rec.fields.json.value) : null;
 }
 
 /**
@@ -105,12 +110,12 @@ export async function appendOps(cfg, ops, handled = []) {
   for (let attempt = 0; attempt < 6; attempt++) {
     const [rec] = await lookup(cfg, ['pl-inbox']);
     const exists = !!(rec && rec.fields && rec.fields.json);
-    const cur = exists ? ((jsonOf(rec) || {}).ops || []) : [];
+    const cur = exists ? ((jsonOf(cfg, rec) || {}).ops || []) : [];
     const now = Date.now();
     const keep = cur.filter((o) => o && o.id && !gone.has(o.id) && now - (o.ts || 0) < 3 * 86400000);
     const have = new Set(keep.map((o) => o.id));
     const next = [...keep, ...ops.filter((o) => !have.has(o.id))].slice(-60);
-    const record = { recordType: TYPE, recordName: 'pl-inbox', fields: { json: { value: JSON.stringify({ ops: next }) }, updatedAt: { value: now, type: 'INT64' } } };
+    const record = { recordType: TYPE, recordName: 'pl-inbox', fields: { json: { value: seal(cfg.k, { ops: next }) }, updatedAt: { value: now, type: 'INT64' } } };
     if (exists) record.recordChangeTag = rec.recordChangeTag;
     const out = await modify(cfg, [{ operationType: exists ? 'update' : 'create', record }]);
     const r = out[0] || {};

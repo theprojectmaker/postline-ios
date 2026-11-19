@@ -9,16 +9,24 @@ import * as app from '../src/cloudcore.js';
 
 const { ck: cc } = loadConfig();
 const d = Buffer.from(crypto.createPrivateKey(fs.readFileSync(cc.pemPath)).export({ format: 'jwk' }).d, 'base64url').toString('hex');
-const cfg = { container: cc.container, environment: cc.environment, keyId: cc.keyId, d };
+const cfg = { container: cc.container, environment: cc.environment, keyId: cc.keyId, d, k: cc.dataKey };
 const bridge = makeCk(cc);
 const ok = (c, m) => { console.log((c ? 'PASS ' : 'FAIL ') + m); if (!c) process.exitCode = 1; };
 
+// the app's seal.js and the bridge's seal.mjs must agree, both ways, and reject tampering
+import * as bseal from '../bridge/seal.mjs';
+const aseal = await import('../src/seal.js');
+const probe = { a: 1, s: 'héllo ✉️', big: 'x'.repeat(5000) };
+ok(JSON.stringify(aseal.unseal(cc.dataKey, bseal.seal(cc.dataKey, probe))) === JSON.stringify(probe), 'bridge-sealed data opens in the app');
+ok(JSON.stringify(bseal.unseal(cc.dataKey, aseal.seal(cc.dataKey, probe))) === JSON.stringify(probe), 'app-sealed data opens in the bridge');
+const bad = Buffer.from(bseal.seal(cc.dataKey, probe), 'base64'); bad[60] ^= 1;
+ok((() => { try { aseal.unseal(cc.dataKey, bad.toString('base64')); return false; } catch { return true; } })(), 'a flipped bit is rejected');
 const sums = [{ id: 'T1', subject: 'Hello ✉️', from: 'A <a@x.com>', snippet: 'hi', date: Date.now(), unread: true, n: 1, flags: ['inbox'] }];
 const ver = Date.now();
 await bridge.save([
   { name: 'pl-list-9', json: bridge.pack(sums), ver },
   { name: 'pl-t-TEST', json: bridge.pack({ id: 'TEST', subject: 'Hello ✉️', msgs: [{ id: 'm1', text: 'body ünïcode' }] }), ver },
-  { name: 'pl-state-test', json: JSON.stringify({ ts: Date.now(), ver, parts: 1 }), ver },
+  { name: 'pl-state-test', json: bridge.pack({ ts: Date.now(), ver, parts: 1 }), ver },
 ]);
 let t0 = Date.now();
 const [st] = await app.lookup(cfg, ['pl-state-test']);

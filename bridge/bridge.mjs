@@ -43,7 +43,7 @@ let publishing = false, pendingForce = false, lastPublish = 0, info = { unread: 
 async function publishState(extra = {}) {
   const handled = Object.fromEntries(Object.entries(S.done).sort((a, b) => b[1].ts - a[1].ts).slice(0, 100).map(([k, v]) => [k, { ok: v.ok, err: v.err, ts: v.ts, ...(v.res || {}) }]));
   const body = { ts: Date.now(), online: true, account, ver: S.ver, parts: S.parts, unread: info.unread, handled, ...extra };
-  await ck.save([{ name: 'pl-state', json: JSON.stringify(body), ver: Date.now() }]);
+  await ck.save([{ name: 'pl-state', json: ck.pack(body), ver: Date.now() }]);
   lastPublish = Date.now();
 }
 
@@ -56,7 +56,8 @@ async function sync(wanted = []) {
   const writes = [];
   let touched = removed.length > 0;
   const rankOf = (id) => [...ids.keys()].indexOf(id);
-  await pool(changed, 4, async ([id]) => {
+  await pool(changed, 4, async ([id, h]) => {
+    if (mail.summaryOf && !wanted.includes(id) && !S.written[id] && rankOf(id) >= cfg.prewarm && mail.summaryOf(id)) { S.sums[id] = mail.summaryOf(id); S.threads[id] = h; touched = true; return; } // list line is enough until it is opened
     let r; try { r = await detailRecord(id); } catch (e) { if (/404|not found/i.test(e.message)) { delete S.sums[id]; touched = true; return; } throw e; }
     const { summary, item } = r;
     S.sums[id] = summary; S.threads[id] = summary.h; touched = true;
@@ -82,11 +83,11 @@ async function execute(op) {
       if (!String(op.to || '').trim()) throw new Error('No recipient');
       return { res: await mail.send(op), mail: true };
     }
-    case 'mark': await mail.mark(op.id, !!op.read); return { mail: true };
-    case 'archive': await mail.archive(op.id); return { mail: true };
-    case 'trash': await mail.trash(op.id); return { mail: true };
-    case 'star': await mail.star(op.id, !!op.on); return { mail: true };
-    case 'open': return { want: [op.id] };
+    case 'mark': await mail.mark(op.th, !!op.read); return { mail: true };
+    case 'archive': await mail.archive(op.th); return { mail: true };
+    case 'trash': await mail.trash(op.th); return { mail: true };
+    case 'star': await mail.star(op.th, !!op.on); return { mail: true };
+    case 'open': return { want: [op.th] };
     case 'refresh': return { mail: true };
     case 'search': {
       const sums = (await mail.search(String(op.q || ''))).sort((a, b) => b.date - a.date);

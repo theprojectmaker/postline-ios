@@ -2,7 +2,7 @@
 // Classroom checker's cloud.mjs; the key file and container come from bridge/config.json (never committed).
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import zlib from 'node:zlib';
+import { seal, unseal } from './seal.mjs';
 
 const HOST = 'https://api.apple-cloudkit.com';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -55,7 +55,7 @@ export function makeCk(cfg) {
       if (bad) throw Object.assign(new Error(`CloudKit save failed: ${bad.serverErrorCode} ${bad.reason || ''}`), { code: bad.serverErrorCode });
     }
   }
-  const jsonOf = (r) => { try { return r && r.fields && r.fields.json ? JSON.parse(r.fields.json.value) : null; } catch { return null; } };
-  const pack = (obj) => zlib.gzipSync(Buffer.from(JSON.stringify(obj), 'utf8')).toString('base64');
+  const jsonOf = (r) => { try { return r && r.fields && r.fields.json ? unseal(cfg.dataKey, r.fields.json.value) : null; } catch { return null; } };
+  const pack = (obj) => seal(cfg.dataKey, obj); // everything written to CloudKit is end-to-end encrypted
   return { call, lookup, save, jsonOf, pack };
 }

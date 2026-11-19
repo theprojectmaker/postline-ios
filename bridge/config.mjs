@@ -1,5 +1,6 @@
 // Loads bridge/config.json (gitignored). Missing CloudKit values default to the Classroom Feed container + key on this PC:
 // Postline shares that container (its records are all named "pl-*"), so no new Apple portal setup is needed.
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +20,11 @@ export function loadConfig() {
     pemPath: path.join(classroomKeys, 'private.pem'), ...(c.ck || {}),
   };
   if (!path.isAbsolute(ck.pemPath)) ck.pemPath = path.resolve(here, ck.pemPath);
+  if (!ck.dataKey) { // the shared end-to-end key: made once, kept in config.json (gitignored), also baked into the app via CF_SEED
+    ck.dataKey = crypto.randomBytes(32).toString('hex');
+    const cf = path.join(here, 'config.json'); const cur = readJson(cf, {});
+    fs.writeFileSync(cf, JSON.stringify({ ...cur, ck: { ...(cur.ck || {}), dataKey: ck.dataKey } }, null, 2));
+  }
   const google = c.google || {};
-  return { ck, google, backend: c.backend || 'web', profile: path.resolve(here, c.profile || 'profile'), chromePath: c.chromePath || '', inboxMax: c.inboxMax || 60, sentMax: c.sentMax || 25, starMax: c.starMax || 15, prewarm: c.prewarm || 40 };
+  return { ck, google, backend: c.backend || 'web', profile: path.resolve(here, c.profile || 'profile'), chromePath: c.chromePath || '', inboxMax: c.inboxMax || 60, sentMax: c.sentMax || 25, starMax: c.starMax || 15, prewarm: c.prewarm || 20 };
 }

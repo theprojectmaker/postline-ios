@@ -4,9 +4,7 @@ import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Haptics from 'expo-haptics';
 import { SEED } from './seed';
-import { appendOps, readList, readState, readThread, lookup, canUse } from './cloudcore';
-import { gunzipSync, strFromU8 } from 'fflate';
-import { base64ToBytes } from './cksign';
+import { appendOps, readList, readState, readThread, readSearch, canUse } from './cloudcore';
 import { uid } from './util';
 import * as demo from './demo';
 
@@ -101,10 +99,10 @@ export function MailProvider({ children }) {
   }, [refresh]);
 
   const act = useMemo(() => ({
-    markRead: (id, read) => enqueue({ t: 'mark', id, read }, { id, patch: { unread: !read } }),
-    archive: (id) => enqueue({ t: 'archive', id }, { id, patch: { gone: 'archive' } }),
-    trash: (id) => enqueue({ t: 'trash', id }, { id, patch: { gone: 'trash' } }),
-    star: (id, on) => enqueue({ t: 'star', id, on }, { id, patch: { star: on } }),
+    markRead: (id, read) => enqueue({ t: 'mark', th: id, read }, { id, patch: { unread: !read } }),
+    archive: (id) => enqueue({ t: 'archive', th: id }, { id, patch: { gone: 'archive' } }),
+    trash: (id) => enqueue({ t: 'trash', th: id }, { id, patch: { gone: 'trash' } }),
+    star: (id, on) => enqueue({ t: 'star', th: id, on }, { id, patch: { star: on } }),
     send: (m) => enqueue({ t: 'send', ...m }),
     syncNow: () => enqueue({ t: 'refresh' }),
   }), [enqueue]);
@@ -124,7 +122,7 @@ export function MailProvider({ children }) {
         if (t) { best = t; if (!want || t.h === want) { stash(id, t); return t; } }
       } catch (e) { if (best) return best; }
       if (i === 0 && best && best !== cached) { /* stale copy is on screen already */ }
-      if (!asked) { asked = true; enqueue({ t: 'open', id }); }
+      if (!asked) { asked = true; enqueue({ t: 'open', th: id }); }
       if (best && i >= 6) { stash(id, best); return best; }
       await new Promise((r) => setTimeout(r, 2500));
     }
@@ -137,9 +135,8 @@ export function MailProvider({ children }) {
       if (signal && signal.aborted) return null;
       await new Promise((r) => setTimeout(r, 2500));
       try {
-        const recs = await lookup(R.current.cfg, [`pl-s-${id}`]);
-        const r = recs[0];
-        if (r && r.fields && r.fields.json) return JSON.parse(strFromU8(gunzipSync(base64ToBytes(r.fields.json.value))));
+        const r = await readSearch(R.current.cfg, id);
+        if (r) return r;
         const h = R.current.handled[id];
         if (h && !h.ok) throw new Error(h.err || 'Search failed');
       } catch (e) { if (/Search failed|Failed/.test(String(e.message))) throw e; }
