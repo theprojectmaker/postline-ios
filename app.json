@@ -1,0 +1,43 @@
+{
+  "expo": {
+    "name": "Postline",
+    "slug": "postline",
+    "version": "1.0.0",
+    "orientation": "default",
+    "scheme": "postline",
+    "userInterfaceStyle": "light",
+    "backgroundColor": "#FFFFFF",
+    "icon": "./assets/icon.png",
+    "ios": {
+      "bundleIdentifier": "com.solyapps.postline",
+      "supportsTablet": true,
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "web": {
+      "output": "single",
+      "backgroundColor": "#FFFFFF"
+    },
+    "plugins": [
+      "expo-font"
+    ],
+    "splash": {
+      "backgroundColor": "#E0305F",
+      "image": "./assets/splash.png",
+      "resizeMode": "contain"
+    },
+    "owner": "solomonsasson",
+    "runtimeVersion": "shell-1",
+    "updates": {
+      "url": "https://u.expo.dev/21d149c3-60cd-45cc-8ee1-1275ff65ff35",
+      "checkAutomatically": "ON_LOAD",
+      "fallbackToCacheTimeout": 0
+    },
+    "extra": {
+      "eas": {
+        "projectId": "21d149c3-60cd-45cc-8ee1-1275ff65ff35"
+      }
+    }
+  }
+}

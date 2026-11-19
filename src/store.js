@@ -1,0 +1,163 @@
+// Mail state: talks to iCloud, keeps a local cache (so the app opens instantly and works offline), queues requests.
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { AppState } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Haptics from 'expo-haptics';
+import { SEED } from './seed';
+import { appendOps, readList, readState, readThread, lookup, canUse } from './cloudcore';
+import { gunzipSync, strFromU8 } from 'fflate';
+import { base64ToBytes } from './cksign';
+import { uid } from './util';
+import * as demo from './demo';
+
+const Ctx = createContext(null);
+export const useMail = () => useContext(Ctx);
+
+export const cfgFromSeed = () => { try { const s = SEED ? JSON.parse(SEED) : null; return s && s.container ? s : null; } catch { return null; } };
+const K = { list: 'pl.list', ver: 'pl.ver', pend: 'pl.pending', failed: 'pl.failed', status: 'pl.status', th: 'pl.th.' , ths: 'pl.thidx' };
+const jget = async (k, d) => { try { const v = await AsyncStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } };
+const jset = (k, v) => AsyncStorage.setItem(k, JSON.stringify(v)).catch(() => {});
+const ago = (ms) => Date.now() - (ms || 0);
+
+export function MailProvider({ children }) {
+  const cfg = useMemo(cfgFromSeed, []);
+  const [list, setList] = useState([]);
+  const [status, setStatus] = useState(null);       // last pl-state
+  const [net, setNet] = useState({ ok: true, err: '', at: 0, busy: false }); // can this device reach iCloud?
+  const [pending, setPending] = useState([]);       // requests not yet acknowledged by the bridge [{op, sent}]
+  const [failed, setFailed] = useState([]);         // requests the bridge refused [{op, err}]
+  const [over, setOver] = useState({});             // optimistic overrides {threadId: {unread?,flags?,gone?}}
+  const R = useRef({ ver: 0, pending: [], failed: [], busy: false, cfg, handled: {} });
+  R.current.pending = pending; R.current.failed = failed;
+  const threads = useRef({});                        // conversation cache {id: detail}
+  const [, bump] = useState(0);
+
+  // ---- load cache
+  useEffect(() => { if (demo.isDemo()) { setList(demo.list); setStatus(demo.status); return; } (async () => {
+    const [l, v, p, f, s] = await Promise.all([jget(K.list, []), jget(K.ver, 0), jget(K.pend, []), jget(K.failed, []), jget(K.status, null)]);
+    R.current.ver = v; setList(l); setPending(p); setFailed(f); setStatus(s);
+  })(); }, []);
+  useEffect(() => { jset(K.pend, pending); }, [pending]);
+  useEffect(() => { jset(K.failed, failed); }, [failed]);
+
+  const stash = (id, d) => { threads.current[id] = d; AsyncStorage.setItem(K.th + id, JSON.stringify(d)).catch(() => {});
+    jget(K.ths, []).then((ix) => { const n = [id, ...ix.filter((x) => x !== id)]; n.slice(40).forEach((x) => AsyncStorage.removeItem(K.th + x).catch(() => {})); jset(K.ths, n.slice(0, 40)); }); };
+
+  // ---- the refresh cycle: state -> list when its version changed -> flush queued requests
+  const flush = useCallback(async () => {
+    const todo = R.current.pending.filter((p) => !p.sent);
+    if (!todo.length || !canUse(R.current.cfg)) return;
+    await appendOps(R.current.cfg, todo.map((p) => p.op), Object.keys(R.current.handled));
+    const ids = new Set(todo.map((p) => p.op.id));
+    setPending((cur) => cur.map((p) => (ids.has(p.op.id) ? { ...p, sent: true } : p)));
+  }, []);
+
+  const refresh = useCallback(async () => {
+    const c = R.current;
+    if (demo.isDemo()) return;
+    if (!canUse(c.cfg) || c.busy) return;
+    c.busy = true; setNet((n) => ({ ...n, busy: true }));
+    try {
+      const st = await readState(c.cfg);
+      if (st) {
+        c.handled = st.handled || {};
+        setStatus(st); jset(K.status, st);
+        if (st.ver && st.ver !== c.ver) {
+          const { items, ver } = await readList(c.cfg, 'pl-list', st.parts);
+          c.ver = ver; setList(items); jset(K.list, items); jset(K.ver, ver); setOver({});
+        }
+        // requests the bridge has answered
+        const h = st.handled || {};
+        const done = R.current.pending.filter((p) => h[p.op.id]);
+        if (done.length) {
+          setPending((cur) => cur.filter((p) => !h[p.op.id]));
+          const bad = done.filter((p) => !h[p.op.id].ok).map((p) => ({ op: p.op, err: h[p.op.id].err || 'Failed' }));
+          if (bad.length) { setFailed((cur) => [...cur, ...bad]); Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error).catch(() => {}); }
+        }
+        // a request whose answer fell out of the bridge's record (older than its list) is certainly old: drop it
+        setPending((cur) => cur.filter((p) => !(p.sent && ago(p.op.ts) > 2 * 86400000)));
+      }
+      await flush();
+      setNet({ ok: true, err: '', at: Date.now(), busy: false });
+    } catch (e) {
+      setNet({ ok: false, err: String(e.message || e).slice(0, 120), at: Date.now(), busy: false });
+    } finally { c.busy = false; }
+  }, [flush]);
+
+  useEffect(() => {
+    refresh();
+    const t = setInterval(() => { if (AppState.currentState === 'active') refresh(); }, 7000);
+    const sub = AppState.addEventListener('change', (s) => { if (s === 'active') refresh(); });
+    return () => { clearInterval(t); sub.remove(); };
+  }, [refresh]);
+
+  // ---- requests
+  const enqueue = useCallback((op, optimistic) => {
+    const full = { id: uid(), ts: Date.now(), ...op };
+    setPending((cur) => [...cur, { op: full, sent: false }]);
+    if (optimistic) setOver((o) => ({ ...o, [optimistic.id]: { ...(o[optimistic.id] || {}), ...optimistic.patch } }));
+    setTimeout(refresh, 50); // the refresh cycle flushes the queue
+    return full.id;
+  }, [refresh]);
+
+  const act = useMemo(() => ({
+    markRead: (id, read) => enqueue({ t: 'mark', id, read }, { id, patch: { unread: !read } }),
+    archive: (id) => enqueue({ t: 'archive', id }, { id, patch: { gone: 'archive' } }),
+    trash: (id) => enqueue({ t: 'trash', id }, { id, patch: { gone: 'trash' } }),
+    star: (id, on) => enqueue({ t: 'star', id, on }, { id, patch: { star: on } }),
+    send: (m) => enqueue({ t: 'send', ...m }),
+    syncNow: () => enqueue({ t: 'refresh' }),
+  }), [enqueue]);
+
+  // ---- conversations: cache first, then iCloud; when the bridge has not written it yet, ask for it and wait
+  const loadThread = useCallback(async (id, { signal } = {}) => {
+    if (demo.isDemo()) return demo.thread(id);
+    const cached = threads.current[id] || await jget(K.th + id, null);
+    if (cached) threads.current[id] = cached;
+    const want = (list.find((x) => x.id === id) || {}).h;
+    if (cached && (!want || cached.h === want)) return cached;
+    let asked = false, best = cached;
+    for (let i = 0; i < 25; i++) {
+      if (signal && signal.aborted) return best;
+      try {
+        const t = await readThread(R.current.cfg, id);
+        if (t) { best = t; if (!want || t.h === want) { stash(id, t); return t; } }
+      } catch (e) { if (best) return best; }
+      if (i === 0 && best && best !== cached) { /* stale copy is on screen already */ }
+      if (!asked) { asked = true; enqueue({ t: 'open', id }); }
+      if (best && i >= 6) { stash(id, best); return best; }
+      await new Promise((r) => setTimeout(r, 2500));
+    }
+    return best;
+  }, [list, enqueue]);
+
+  const search = useCallback(async (q, signal) => {
+    const id = enqueue({ t: 'search', q });
+    for (let i = 0; i < 30; i++) {
+      if (signal && signal.aborted) return null;
+      await new Promise((r) => setTimeout(r, 2500));
+      try {
+        const recs = await lookup(R.current.cfg, [`pl-s-${id}`]);
+        const r = recs[0];
+        if (r && r.fields && r.fields.json) return JSON.parse(strFromU8(gunzipSync(base64ToBytes(r.fields.json.value))));
+        const h = R.current.handled[id];
+        if (h && !h.ok) throw new Error(h.err || 'Search failed');
+      } catch (e) { if (/Search failed|Failed/.test(String(e.message))) throw e; }
+    }
+    return null;
+  }, [enqueue]);
+
+  // ---- derived view of the list (optimistic overrides applied)
+  const visible = useMemo(() => list.map((t) => {
+    const o = over[t.id]; if (!o) return t;
+    const flags = o.star === undefined ? t.flags : (o.star ? [...new Set([...(t.flags || []), 'star'])] : (t.flags || []).filter((f) => f !== 'star'));
+    const fl = o.gone === 'archive' ? flags.filter((f) => f !== 'inbox') : flags;
+    return { ...t, unread: o.unread === undefined ? t.unread : o.unread, flags: fl, trashed: o.gone === 'trash' };
+  }).filter((t) => !t.trashed), [list, over]);
+
+  const online = demo.isDemo() || !!(status && ago(status.ts) < 150000);
+  const value = { cfg: cfg || (demo.isDemo() ? { demo: 1 } : null), list: visible, status, net, online, pending, failed, dismissFailed: (id) => setFailed((c) => c.filter((f) => f.op.id !== id)),
+    retryFailed: (f) => { setFailed((c) => c.filter((x) => x.op.id !== f.op.id)); { const { id, ts, ...rest } = f.op; enqueue(rest); }; },
+    refresh, act, loadThread, search, bump: () => bump((x) => x + 1) };
+  return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
+}
