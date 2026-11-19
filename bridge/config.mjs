@@ -20,5 +20,5 @@ export function loadConfig() {
   };
   if (!path.isAbsolute(ck.pemPath)) ck.pemPath = path.resolve(here, ck.pemPath);
   const google = c.google || {};
-  return { ck, google, inboxMax: c.inboxMax || 60, sentMax: c.sentMax || 25, starMax: c.starMax || 15, prewarm: c.prewarm || 40 };
+  return { ck, google, backend: c.backend || 'web', profile: path.resolve(here, c.profile || 'profile'), chromePath: c.chromePath || '', inboxMax: c.inboxMax || 60, sentMax: c.sentMax || 25, starMax: c.starMax || 15, prewarm: c.prewarm || 40 };
 }

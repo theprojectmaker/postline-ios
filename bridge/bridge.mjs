@@ -4,19 +4,21 @@
 // Usage: node bridge/bridge.mjs [--once]      (--once: one sync + one request pass, then exit)
 import fs from 'node:fs';
 import path from 'node:path';
-import { loadConfig, GMAIL_TOKEN, STATE_FILE, here } from './config.mjs';
+import { loadConfig, STATE_FILE, here } from './config.mjs';
 import { makeCk, PART } from './ck.mjs';
-import { makeGmail, parseThread, buildRaw } from './gmail.mjs';
 
 const cfg = loadConfig();
 const ONCE = process.argv.includes('--once');
 const log = (...a) => { const l = `${new Date().toISOString()} ${a.join(' ')}`; console.log(l); try { fs.appendFileSync(path.join(here, 'bridge.log'), l + '\n'); } catch { /* ignore */ } };
-if (!fs.existsSync(GMAIL_TOKEN)) { console.error('Gmail is not connected yet. Run: node bridge/auth.mjs'); process.exit(1); }
 if (!fs.existsSync(cfg.ck.pemPath)) { console.error('CloudKit key not found at ' + cfg.ck.pemPath + ' (set ck.pemPath in bridge/config.json)'); process.exit(1); }
 
 const ck = makeCk(cfg.ck);
-const { g } = makeGmail(GMAIL_TOKEN, cfg.google);
-const account = JSON.parse(fs.readFileSync(GMAIL_TOKEN, 'utf8')).account || '';
+let mail, account = '';
+async function startBackend() {
+  if (cfg.backend === 'api') mail = await (await import('./api-backend.mjs')).makeApiBackend(cfg);
+  else mail = await (await import('./web-backend.mjs')).makeWebBackend(cfg, log);
+  account = (mail.account || '').toLowerCase();
+}
 
 const S = (() => { try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; } })();
 S.threads ||= {}; S.sums ||= {}; S.done ||= {}; S.ver ||= 0; S.parts ||= 0; S.written ||= {};
@@ -29,15 +31,12 @@ async function pool(items, n, fn) {
   return out;
 }
 
-const getThread = (id) => g('GET', `/threads/${id}?format=full`);
-function detailRecord(t) {
-  for (const o of [{}, { maxText: 15000, maxHtml: 0 }, { maxText: 4000, maxHtml: 0 }]) {
-    const { summary, detail } = parseThread(t, o);
+async function detailRecord(id) {
+  for (const o of [{}, { maxText: 15000, maxHtml: 0 }, { maxText: 4000, maxHtml: 0 }, { maxText: 500, maxHtml: 0 }]) {
+    const { summary, detail } = await mail.fetchThread(id, o);
     const json = ck.pack(detail);
-    if (json.length < 900000) return { summary, item: { name: `pl-t-${t.id}`, json, ver: Date.now() } };
+    if (json.length < 900000 || o.maxText === 500) return { summary, item: { name: `pl-t-${id}`, json, ver: Date.now() } };
   }
-  const { summary, detail } = parseThread(t, { maxText: 500, maxHtml: 0 });
-  return { summary, item: { name: `pl-t-${t.id}`, json: ck.pack(detail), ver: Date.now() } };
 }
 
 let publishing = false, pendingForce = false, lastPublish = 0, info = { unread: 0 };
@@ -50,12 +49,7 @@ async function publishState(extra = {}) {
 
 /** Gmail -> CloudKit. Fetches only threads whose historyId changed. */
 async function sync(wanted = []) {
-  const ids = new Map();
-  const add = async (label, max) => {
-    const r = await g('GET', `/threads?labelIds=${label}&maxResults=${max}`);
-    for (const t of r.threads || []) if (!ids.has(t.id)) ids.set(t.id, t.historyId);
-  };
-  await add('INBOX', cfg.inboxMax); await add('SENT', cfg.sentMax); await add('STARRED', cfg.starMax);
+  const ids = await mail.listIds();
   for (const w of wanted) if (!ids.has(w)) ids.set(w, '');
   const changed = [...ids.entries()].filter(([id, h]) => wanted.includes(id) || !S.threads[id] || S.threads[id] !== h);
   const removed = Object.keys(S.sums).filter((id) => !ids.has(id));
@@ -63,8 +57,8 @@ async function sync(wanted = []) {
   let touched = removed.length > 0;
   const rankOf = (id) => [...ids.keys()].indexOf(id);
   await pool(changed, 4, async ([id]) => {
-    let t; try { t = await getThread(id); } catch (e) { if (/404/.test(e.message)) { delete S.sums[id]; touched = true; return; } throw e; }
-    const { summary, item } = detailRecord(t);
+    let r; try { r = await detailRecord(id); } catch (e) { if (/404|not found/i.test(e.message)) { delete S.sums[id]; touched = true; return; } throw e; }
+    const { summary, item } = r;
     S.sums[id] = summary; S.threads[id] = summary.h; touched = true;
     if (wanted.includes(id) || S.written[id] || rankOf(id) < cfg.prewarm) { writes.push(item); S.written[id] = 1; }
   });
@@ -76,29 +70,26 @@ async function sync(wanted = []) {
   const ver = Date.now(), parts = Math.max(1, Math.ceil(json.length / PART));
   await ck.save(Array.from({ length: parts }, (_, i) => ({ name: `pl-list-${i}`, json: json.slice(i * PART, (i + 1) * PART), ver })));
   S.ver = ver; S.parts = parts;
-  try { const l = await g('GET', '/labels/INBOX'); info.unread = l.threadsUnread || 0; } catch { /* ignore */ }
+  info.unread = await mail.unread();
   save(); await publishState();
   log(`sync: ${changed.length} changed, ${removed.length} removed, ${writes.length} conversations written, ${list.length} in list`);
   return changed.length;
 }
 
-const modify = (id, add, remove) => g('POST', `/threads/${id}/modify`, { addLabelIds: add, removeLabelIds: remove });
 async function execute(op) {
   switch (op.t) {
     case 'send': {
       if (!String(op.to || '').trim()) throw new Error('No recipient');
-      const r = await g('POST', '/messages/send', { raw: buildRaw(op), ...(op.threadId ? { threadId: op.threadId } : {}) });
-      return { res: { msg: r.id }, mail: true };
+      return { res: await mail.send(op), mail: true };
     }
-    case 'mark': await modify(op.id, op.read ? [] : ['UNREAD'], op.read ? ['UNREAD'] : []); return { mail: true };
-    case 'archive': await modify(op.id, [], ['INBOX']); return { mail: true };
-    case 'trash': await g('POST', `/threads/${op.id}/trash`); return { mail: true };
-    case 'star': await modify(op.id, op.on ? ['STARRED'] : [], op.on ? [] : ['STARRED']); return { mail: true };
+    case 'mark': await mail.mark(op.id, !!op.read); return { mail: true };
+    case 'archive': await mail.archive(op.id); return { mail: true };
+    case 'trash': await mail.trash(op.id); return { mail: true };
+    case 'star': await mail.star(op.id, !!op.on); return { mail: true };
     case 'open': return { want: [op.id] };
     case 'refresh': return { mail: true };
     case 'search': {
-      const r = await g('GET', `/threads?q=${encodeURIComponent(String(op.q || '').slice(0, 200))}&maxResults=25`);
-      const sums = (await pool(r.threads || [], 4, async (t) => parseThread(await getThread(t.id)).summary)).sort((a, b) => b.date - a.date);
+      const sums = (await mail.search(String(op.q || ''))).sort((a, b) => b.date - a.date);
       await ck.save([{ name: `pl-s-${op.id}`, json: ck.pack(sums), ver: Date.now() }]);
       return { res: { n: sums.length } };
     }
@@ -137,6 +128,7 @@ async function tick(force) {
   } finally { publishing = false; }
 }
 
-log(`Postline bridge starting for ${account} -> ${cfg.ck.container} (${cfg.ck.environment})`);
+await startBackend();
+log(`Postline bridge (${mail.name}) starting for ${account} -> ${cfg.ck.container} (${cfg.ck.environment})`);
 await tick(true);
 if (!ONCE) { for (;;) { await sleep(5000); await tick(pendingForce); pendingForce = false; } }

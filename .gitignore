@@ -47,3 +47,5 @@ bridge/config.json
 bridge/state.json
 bridge/*.log
 scripts/.apptest/
+bridge/profile/
+bridge/last-*.png
