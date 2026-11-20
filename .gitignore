@@ -51,3 +51,4 @@ bridge/profile/
 bridge/last-*.png
 scripts/.last-send-id
 scripts/.ops-ids
+scripts/_*
