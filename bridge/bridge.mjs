@@ -12,6 +12,8 @@ const ONCE = process.argv.includes('--once');
 const log = (...a) => { const l = `${new Date().toISOString()} ${a.join(' ')}`; console.log(l); try { fs.appendFileSync(path.join(here, 'bridge.log'), l + '\n'); } catch { /* ignore */ } };
 if (!fs.existsSync(cfg.ck.pemPath)) { console.error('CloudKit key not found at ' + cfg.ck.pemPath + ' (set ck.pemPath in bridge/config.json)'); process.exit(1); }
 
+// single instance: a second copy would fight over the same Chrome profile
+import('node:net').then(({ default: net }) => net.createServer().on('error', () => { console.error('Another Postline bridge is already running.'); process.exit(3); }).listen(8793, '127.0.0.1')).catch(() => {});
 const ck = makeCk(cfg.ck);
 let mail, account = '';
 async function startBackend() {
@@ -117,6 +119,7 @@ async function processOps() {
 }
 
 async function tick(force) {
+  if (fs.existsSync(path.join(here, 'PAUSE'))) return; // kill switch: create a file named PAUSE in bridge/
   if (publishing) { pendingForce ||= force; return; }
   publishing = true;
   try {
