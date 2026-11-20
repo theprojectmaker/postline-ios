@@ -29,15 +29,16 @@ function IconBtn({ name, onPress, color = T.tint, disabled, size = 24, label }) 
 // ---------- status banner
 export function Banner() {
   const { net, online, pending, failed, status, dismissFailed, retryFailed, cfg } = useMail();
+  const ins = useSafeAreaInsets();
   const rows = [];
   if (!cfg) rows.push({ k: 'nokey', c: T.red, t: 'This build has no iCloud key. Install the latest TestFlight build.' });
   else if (!net.ok && net.at) rows.push({ k: 'net', c: T.amber, t: 'Can’t reach iCloud right now. Showing saved mail.' });
   else if (status && !online) rows.push({ k: 'pc', c: T.amber, t: 'Your computer’s Postline bridge is offline. New mail is paused; anything you send will go out when it’s back.' });
   else if (!status && net.at && net.ok) rows.push({ k: 'wait', c: T.amber, t: 'Waiting for the Postline bridge on your computer to publish your mail.' });
-  failed.forEach((f) => rows.push({ k: f.op.id, c: T.red, t: `${f.op.t === 'send' ? 'Message to ' + (f.op.to || '').slice(0, 30) : 'A change'} failed: ${f.err}`, f }));
+  failed.filter((f) => Date.now() - (f.op.ts || 0) < 1800000).forEach((f) => rows.push({ k: f.op.id, c: T.red, t: `${f.op.t === 'send' ? 'Message to ' + (f.op.to || '').slice(0, 30) : 'A change'} failed: ${f.err}`, f }));
   if (!rows.length) return null;
   return (
-    <View>
+    <View style={{ paddingTop: ins.top }}>
       {rows.map((r) => (
         <View key={r.k} style={[st.banner, { backgroundColor: r.c + '22' }]}>
           <Ionicons name={r.f ? 'alert-circle' : 'information-circle'} size={18} color={r.c} />
@@ -271,7 +272,7 @@ export function Conversation({ id, onBack, onCompose, wide, onGone }) {
 
 // ---------- "Sending…" pop-up: spins while the message travels, flips to a check when Gmail has sent it
 export function SendPopup() {
-  const { sends, clearSend } = useMail();
+  const { sends, clearSend, online } = useMail();
   const cur = sends[sends.length - 1];
   const pop = useRef(new Animated.Value(0)).current;
   const spin = useRef(new Animated.Value(0)).current;
@@ -289,22 +290,25 @@ export function SendPopup() {
   }, [status]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (!curId || status === 'sending') return undefined;
-    if (status === 'sent') Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
-    const t = setTimeout(() => Animated.timing(pop, { toValue: 0, duration: 220, useNativeDriver: true }).start(() => clearSend(curId)), status === 'sent' ? 1600 : 3200);
+    if (status === 'sent' || (status === 'queued' && online)) Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+    const t = setTimeout(() => Animated.timing(pop, { toValue: 0, duration: 220, useNativeDriver: true }).start(() => clearSend(curId)), status === 'failed' || (status === 'queued' && !online) ? 3600 : 1500);
     return () => clearTimeout(t);
   }, [status, curId]); // eslint-disable-line react-hooks/exhaustive-deps
   if (!cur) return null;
   const rot = spin.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '360deg'] });
   const who = (cur.to || '').split(',')[0].replace(/<.*>/, '').trim();
   return (
+    <Modal transparent visible animationType="none" statusBarTranslucent supportedOrientations={['portrait', 'landscape']}>
     <View pointerEvents="none" style={st.popWrap}>
       <Animated.View style={[st.pop, { opacity: pop, transform: [{ scale: pop.interpolate({ inputRange: [0, 1], outputRange: [0.85, 1] }) }] }]}>
         {status === 'sending' ? <Animated.View style={{ transform: [{ rotate: rot }] }}><Ionicons name="sync" size={34} color={T.tint} /></Animated.View>
-          : status === 'sent' ? <Ionicons name="checkmark-circle" size={40} color={T.green} /> : <Ionicons name="close-circle" size={40} color={T.red} />}
-        <Text style={st.popTitle}>{status === 'sending' ? 'Sending…' : status === 'sent' ? 'Sent' : 'Couldn’t send'}</Text>
-        <Text style={st.popSub} numberOfLines={2}>{status === 'failed' ? (cur.err || 'Tap Retry in the banner.') : who ? 'To ' + who : ''}</Text>
+          : status === 'sent' || (status === 'queued' && online) ? <Ionicons name="checkmark-circle" size={40} color={T.green} />
+            : status === 'queued' ? <Ionicons name="time" size={40} color={T.amber} /> : <Ionicons name="close-circle" size={40} color={T.red} />}
+        <Text style={st.popTitle}>{status === 'sending' ? 'Sending…' : status === 'sent' || (status === 'queued' && online) ? 'Sent' : status === 'queued' ? 'Queued' : 'Couldn’t send'}</Text>
+        <Text style={st.popSub} numberOfLines={2}>{status === 'failed' ? (cur.err || 'Tap Retry in the banner.') : status === 'queued' && !online ? 'Will go out when your PC is back' : who ? 'To ' + who : ''}</Text>
       </Animated.View>
     </View>
+    </Modal>
   );
 }
 

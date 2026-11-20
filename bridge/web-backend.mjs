@@ -30,7 +30,10 @@ export async function makeWebBackend(cfg, log = console.log) {
   const run = (fn) => { const step = async () => { try { return await fn(); } catch (e) { if (!crashed(e)) throw e; log('page crashed, opening a fresh tab'); await fresh(); return fn(); } }; const p = queue.then(step, step); queue = p.catch(() => {}); return p; };
   const shot = async (n) => { try { await page.screenshot({ path: path.join(here, `last-${n}.png`) }); } catch { /* ignore */ } };
 
+  let where = 'idle', lastProgress = Date.now();
+  const at = (x) => { lastProgress = Date.now(); where = x + ' @ ' + new Date().toISOString().slice(11, 19); };
   async function go(hash, waitFor = 'tr.zA, div.nH.h7, .a3s, div[role="main"]') {
+    at('goto ' + hash.slice(0, 30));
     await page.goto(BASE + hash, { waitUntil: 'domcontentloaded' });
     if (isLogin(page.url())) throw Object.assign(new Error('Not signed in to Gmail — run bridge\\login-gmail.cmd, sign in, close the window'), { fatal: true });
     await page.waitForSelector(waitFor, { timeout: 30000 }).catch(() => {});
@@ -39,7 +42,8 @@ export async function makeWebBackend(cfg, log = console.log) {
   }
 
   // the list DOM is reused between views: wait until the tab title says which view is showing, then let the rows settle
-  const TITLES = { inbox: /^Inbox/i, sent: /^Sent/i, starred: /^Starred/i };
+  const HASH = { inbox: '#search/in%3Ainbox', sent: '#sent', starred: '#starred' };
+  const TITLES = { inbox: /^(Search results|Inbox)/i, sent: /^Sent/i, starred: /^Starred/i };
   async function waitView(slug) {
     for (let i = 0; i < 40; i++) { if (TITLES[slug] ? TITLES[slug].test(await page.title()) : i > 6) break; await sleep(250); }
     await sleep(1200);
@@ -48,6 +52,7 @@ export async function makeWebBackend(cfg, log = console.log) {
   // ---- list rows -> summaries (also the change signature)
   const rows = new Map(); // id -> summary from the latest list view
   async function readRows(max) {
+    at('readRows');
     const raw = await page.evaluate(() => [...document.querySelectorAll('tr.zA')].filter((tr) => tr.offsetParent !== null).map((tr) => {
       const idEl = tr.querySelector('[data-legacy-thread-id]');
       const nameEl = tr.querySelector('.yW span[email], .yP, .zF');
@@ -79,10 +84,10 @@ export async function makeWebBackend(cfg, log = console.log) {
 
   // Opens a conversation by clicking its row in whichever list shows it (a direct URL does not open multi-message threads).
   async function openThread(id) {
+    at('openThread');
     for (const slug of ['inbox', 'sent', 'starred']) {
-      await go('#' + slug);
-      await waitView(slug);
-      const row = page.locator(`tr.zA:has([data-legacy-thread-id="${id}"])`).first();
+      if ((await page.evaluate(() => location.hash).catch(() => '')) !== HASH[slug]) { await go(HASH[slug]); await waitView(slug); }
+      const row = page.locator(`tr.zA:visible:has([data-legacy-thread-id="${id}"])`).first();
       if (await row.count()) {
         await row.scrollIntoViewIfNeeded().catch(() => {});
         await row.click({ position: { x: 300, y: 12 }, timeout: 8000 });
@@ -95,6 +100,7 @@ export async function makeWebBackend(cfg, log = console.log) {
 
   // ---- one conversation
   async function readThread(id) {
+    at('readThread');
     const sigOf = () => page.evaluate(() => { const v = (e) => e.offsetParent !== null; const h = [...document.querySelectorAll('h2.hP')].find(v); const b = [...document.querySelectorAll('.a3s')].find(v); return (h ? h.innerText : '') + '|' + (b ? b.innerText.slice(0, 60) : '') + '|' + document.querySelectorAll('div.adn').length; });
     const before = await sigOf().catch(() => '');
     if (!(await openThread(id))) throw new Error('Thread not found');
@@ -139,13 +145,14 @@ export async function makeWebBackend(cfg, log = console.log) {
   // the list toolbar, which appears once a row is ticked, is).
   async function rowFor(id) {
     for (const slug of ['inbox', 'sent', 'starred']) {
-      await go('#' + slug); await waitView(slug);
-      const row = page.locator(`tr.zA:has([data-legacy-thread-id="${id}"])`).first();
+      if ((await page.evaluate(() => location.hash).catch(() => '')) !== HASH[slug]) { await go(HASH[slug]); await waitView(slug); }
+      const row = page.locator(`tr.zA:visible:has([data-legacy-thread-id="${id}"])`).first();
       if (await row.count()) { await row.scrollIntoViewIfNeeded().catch(() => {}); return row; }
     }
     throw new Error('Thread not found');
   }
   async function listAction(id, label) {
+    at('listAction ' + label);
     const row = await rowFor(id);
     await row.locator('div[role="checkbox"]').first().click({ timeout: 8000 });
     await sleep(500);
@@ -178,11 +185,23 @@ export async function makeWebBackend(cfg, log = console.log) {
     await dlg.locator('div[aria-label="Message Body"], div[role="textbox"][g_editable="true"]').first().fill(body || '');
     return dlg;
   }
-  async function pressSend(dlg) {
-    await dlg.locator('div[role="button"][aria-label^="Send"]').first().click();
-    await page.waitForSelector('div[role="dialog"]', { state: 'detached', timeout: 20000 }).catch(() => {});
-    await sleep(1500);
+  // Presses Send, then WAITS for Gmail to confirm: its "Message sent" toast, or the composer closing. No confirmation = not sent:
+  // the half-written message is left as a draft and the request is retried (never reported as sent).
+  async function pressSendAndConfirm(sendBtn) {
+    at('send');
+    await sendBtn.click({ timeout: 10000 });
+    for (let i = 0; i < 44; i++) { // up to ~22 s
+      await sleep(500);
+      if (await page.locator('div[role="alert"]:has-text("Message sent"), span.bAq:has-text("Message sent")').count()) { await sleep(400); return; }
+      const open = await page.locator('div[aria-label="Message Body"]:visible, div[role="textbox"][g_editable="true"]:visible').count();
+      if (!open && i >= 2) { await sleep(600); return; }
+      const err = await page.locator('div[role="alertdialog"], div.Kj-JD:has-text("couldn")').first().innerText().catch(() => '');
+      if (/couldn|not found|invalid|can.?t send|error/i.test(err)) { await page.keyboard.press('Escape').catch(() => {}); throw new Error('Gmail refused to send: ' + err.split('\n')[0].slice(0, 100)); }
+    }
+    await page.keyboard.press('Escape').catch(() => {});
+    throw new Error('Timeout: Gmail did not confirm the send');
   }
+  async function pressSend(dlg) { await pressSendAndConfirm(dlg.locator('div[role="button"][aria-label^="Send"]').first()); }
   // ---- people search: Gmail's own recipient suggestions (includes the school directory), on a second tab so mail work is never blocked
   // three tabs share the work (each handles one query at a time), so the whole school directory can be crawled quickly
   const dirs = Array.from({ length: cfg.dirTabs || 3 }, () => ({ page: null, queue: Promise.resolve(), busy: 0 }));
@@ -216,7 +235,7 @@ export async function makeWebBackend(cfg, log = console.log) {
     listIds: () => run(async () => {
       const ids = new Map();
       for (const [slug, , flag] of BOXES) {
-        await go('#' + slug);
+        await go(HASH[slug]);
         await waitView(slug);
         const max = Math.min(50, slug === 'inbox' ? cfg.inboxMax : slug === 'sent' ? cfg.sentMax : cfg.starMax);
         const rs = await readRows(max);
@@ -257,9 +276,7 @@ export async function makeWebBackend(cfg, log = console.log) {
         await box.waitFor();
         await box.click();
         await box.fill(ownPart(op.body));
-        const dlg = page.locator('form, div[role="dialog"]').last();
-        await page.locator('div[role="button"][aria-label^="Send"]').last().click();
-        void dlg; await sleep(2500);
+        await pressSendAndConfirm(page.locator('div[role="button"][aria-label^="Send"]:visible').last());
         return { via: 'reply' };
       }
       const dlg = await compose(op);
@@ -273,6 +290,8 @@ export async function makeWebBackend(cfg, log = console.log) {
       return (await readRows(25)).map((r) => rowToSummary(r, 'all'));
     }),
     suggest: (q) => dirRun(async (d) => { try { return await suggestOn(d, q); } catch (e) { if (crashed(e)) { d.page = null; return suggestOn(d, q); } throw e; } }),
+    _progress: () => lastProgress,
+    _where: () => `${where}; url=${(() => { try { return page.url().replace(/\/mail\/u\/0\/?/, '/').slice(0, 70); } catch { return '?'; } })()}`,
     close: () => ctx.close(),
     _page: page, _shot: shot,
   };

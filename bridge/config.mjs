@@ -26,5 +26,5 @@ export function loadConfig() {
     fs.writeFileSync(cf, JSON.stringify({ ...cur, ck: { ...(cur.ck || {}), dataKey: ck.dataKey } }, null, 2));
   }
   const google = c.google || {};
-  return { ck, google, backend: c.backend || 'web', profile: path.resolve(here, c.profile || 'profile'), chromePath: c.chromePath || '', inboxMax: c.inboxMax || 60, sentMax: c.sentMax || 25, starMax: c.starMax || 15, prewarm: c.prewarm || 20 };
+  return { ck, google, backend: c.backend || 'web', profile: path.resolve(here, c.profile || 'profile'), chromePath: c.chromePath || '', inboxMax: c.inboxMax || 60, sentMax: c.sentMax || 25, starMax: c.starMax || 15, prewarm: c.prewarm || 8 };
 }

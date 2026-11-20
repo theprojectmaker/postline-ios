@@ -3,6 +3,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { BackHandler, StatusBar, Text, View, useWindowDimensions } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import * as Updates from 'expo-updates';
+import * as Notifications from 'expo-notifications';
 import { AppState } from 'react-native';
 import { MailProvider } from './src/store';
 import { Banner, BOXES, Compose, Conversation, Mailboxes, SendPopup, ThreadList } from './src/views';
@@ -16,6 +17,13 @@ function Shell() {
   const [openId, setOpenId] = useState(null);
   const [draft, setDraft] = useState(null);
   const compose = useCallback((d) => setDraft(d || {}), []);
+  // tapping a new-mail notification opens that conversation
+  useEffect(() => {
+    const open = (r) => { const d = r && r.notification && r.notification.request.content.data; if (d && d.kind === 'mail' && d.id) { setBox('inbox'); setScreen('list'); setOpenId(d.id); } };
+    Notifications.getLastNotificationResponseAsync().then(open).catch(() => {});
+    const sub = Notifications.addNotificationResponseReceivedListener(open);
+    return () => sub.remove();
+  }, []);
   const pickBox = (k) => { setBox(k); setOpenId(null); setScreen('list'); };
 
   useEffect(() => { // Android back (harmless on iOS)
@@ -29,7 +37,7 @@ function Shell() {
 
   return (
     <View style={{ flex: 1, backgroundColor: T.bg }}>
-      <StatusBar barStyle="dark-content" />
+      <StatusBar hidden />
       <Banner />
       {wide ? (
         <View style={{ flex: 1, flexDirection: 'row' }}>

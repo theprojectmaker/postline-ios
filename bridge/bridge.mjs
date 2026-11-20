@@ -35,6 +35,7 @@ function harvest(text) {
   return n;
 }
 const S = (() => { try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; } })();
+S.push ||= {}; S.notified ||= {}; S.pushSince ||= Date.now();
 S.contacts ||= {}; S.crawl ||= { q: 'abcdefghijklmnopqrstuvwxyz'.split(''), done: 0 }; S.cver ||= 0; S.cparts ||= 0;
 S.threads ||= {}; S.sums ||= {}; S.done ||= {}; S.ver ||= 0; S.parts ||= 0; S.written ||= {};
 const save = () => fs.writeFileSync(STATE_FILE, JSON.stringify(S));
@@ -55,6 +56,7 @@ async function detailRecord(id) {
   }
 }
 
+let lastTickDone = Date.now();
 let publishing = false, pendingForce = false, lastPublish = 0, info = { unread: 0 };
 async function publishState(extra = {}) {
   const handled = Object.fromEntries(Object.entries(S.done).sort((a, b) => b[1].ts - a[1].ts).slice(0, 100).map(([k, v]) => [k, { ok: v.ok, err: v.err, ts: v.ts, ...(v.res || {}) }]));
@@ -70,11 +72,22 @@ async function sync(wanted = []) {
   const changed = [...ids.entries()].filter(([id, h]) => wanted.includes(id) || !S.threads[id] || S.threads[id] !== h);
   const removed = Object.keys(S.sums).filter((id) => !ids.has(id));
   const writes = [];
+  let fetchedNow = 0;
   let touched = removed.length > 0;
   const rankOf = (id) => [...ids.keys()].indexOf(id);
   await pool(changed, 4, async ([id, h]) => {
-    if (mail.summaryOf && !wanted.includes(id) && !S.written[id] && rankOf(id) >= cfg.prewarm && mail.summaryOf(id)) { S.sums[id] = mail.summaryOf(id); S.threads[id] = h; touched = true; return; } // list line is enough until it is opened
-    let r; try { r = await detailRecord(id); } catch (e) { if (/404|not found/i.test(e.message)) { delete S.sums[id]; touched = true; return; } throw e; }
+    const must = wanted.includes(id), nice = S.written[id] || rankOf(id) < cfg.prewarm;
+    if (mail.summaryOf && !must && (!nice || fetchedNow >= 4) && mail.summaryOf(id)) { S.sums[id] = mail.summaryOf(id); S.threads[id] = h; touched = true; return; } // list line is enough until it is opened
+    fetchedNow++;
+    let r;
+    try { r = await detailRecord(id); }
+    catch (e) {
+      if (/404|not found/i.test(e.message)) { delete S.sums[id]; touched = true; return; }
+      if (/browser has been closed|context or browser|Target page, context/i.test(e.message)) throw e;
+      log('skipping one conversation:', String(e.message).split('\n')[0].slice(0, 90));
+      if (mail.summaryOf && mail.summaryOf(id)) { S.sums[id] = mail.summaryOf(id); touched = true; } // still show it from its list line
+      return;
+    }
     const { summary, item } = r;
     harvest(summary.from);
     S.sums[id] = summary; S.threads[id] = summary.h; touched = true;
@@ -89,13 +102,59 @@ async function sync(wanted = []) {
   await ck.save(Array.from({ length: parts }, (_, i) => ({ name: `pl-list-${i}`, json: json.slice(i * PART, (i + 1) * PART), ver })));
   S.ver = ver; S.parts = parts;
   info.unread = await mail.unread();
+  await notifyNew();
   save(); await publishState();
   log(`sync: ${changed.length} changed, ${removed.length} removed, ${writes.length} conversations written, ${list.length} in list`);
   return changed.length;
 }
 
+// ---- notifications: Expo's push service (reachable from this PC) -> Apple's push service -> the iPad (works on an Apple-only Wi-Fi)
+const EXPO_PROJECT = '21d149c3-60cd-45cc-8ee1-1275ff65ff35', APP_ID = 'com.solyapps.postline';
+const expoPost = (url, body) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(20000) });
+async function sendPush(msgs) {
+  const tokens = Object.keys(S.push);
+  if (!msgs.length || !tokens.length) return;
+  const res = await expoPost('https://exp.host/--/api/v2/push/send', msgs.flatMap((m) => tokens.map((to) => ({ to, sound: 'default', priority: 'high', ...m }))));
+  const j = await res.json().catch(() => ({}));
+  (j.data || []).forEach((t, i) => { if (t && t.status === 'error' && /DeviceNotRegistered/.test((t.details || {}).error || '')) delete S.push[tokens[i % tokens.length]]; });
+  log(`push: sent ${msgs.length} to ${tokens.length} device(s) -> ${res.status}`);
+}
+const nameOf = (s = '') => { const m = String(s).match(/^\s*"?([^"<]*?)"?\s*</); return (m && m[1].trim()) || String(s).split('@')[0] || 'New mail'; };
+async function notifyNew() {
+  if (!Object.keys(S.push).length) return;
+  const out = [];
+  for (const t of Object.values(S.sums)) {
+    if (!t.unread || !(t.flags || []).includes('inbox') || t.date <= S.pushSince) continue;
+    const key = t.id + ':' + t.n; if (S.notified[key]) continue;
+    S.notified[key] = Date.now();
+    if (account && String(t.from || '').toLowerCase().includes(account)) continue; // my own message
+    out.push({ title: nameOf(t.from), body: (t.subject || '(no subject)') + (t.snippet ? ' — ' + t.snippet.slice(0, 90) : ''), data: { kind: 'mail', id: t.id } });
+  }
+  const keys = Object.keys(S.notified); if (keys.length > 400) keys.sort((a, b) => S.notified[a] - S.notified[b]).slice(0, keys.length - 300).forEach((k) => delete S.notified[k]);
+  if (out.length) await sendPush(out.slice(0, 6)).catch((e) => log('push failed', e.message));
+}
+
 async function execute(op) {
   switch (op.t) {
+    case 'pushreg': { // the iPad cannot reach Expo itself on the school Wi-Fi: make the registration here on its behalf
+      const b = (op.body && typeof op.body === 'object') ? op.body : {};
+      const reg = { type: 'apns', deviceId: String(b.deviceId || '').toLowerCase().slice(0, 80), development: !!b.development, appId: APP_ID, deviceToken: String(b.deviceToken || ''), projectId: EXPO_PROJECT };
+      if (!/^[0-9a-f]{32,200}$/i.test(reg.deviceToken) || !/^[\w-]{8,80}$/.test(reg.deviceId)) return { res: { dropped: 1 } };
+      const res = await expoPost('https://exp.host/--/api/v2/push/getExpoPushToken', reg);
+      const j = await res.json().catch(() => ({}));
+      const tok = String(((j || {}).data || {}).expoPushToken || '');
+      if (!/^ExponentPushToken\[[\w-]+\]$/.test(tok)) throw new Error('Expo refused the registration (' + res.status + ')');
+      S.push[tok] = { at: Date.now() }; S.pushSince = Date.now();
+      await sendPush([{ title: 'Postline', body: 'Notifications are on. New mail will pop up here.', data: { kind: 'test' } }]);
+      return { res: { registered: 1 } };
+    }
+    case 'push': { // a device that could reach Expo itself sent its token
+      const tok = String(op.token || '');
+      if (!/^ExponentPushToken\[[\w-]+\]$/.test(tok)) return { res: { dropped: 1 } };
+      if (!S.push[tok]) { S.push[tok] = { at: Date.now() }; S.pushSince = Date.now(); await sendPush([{ title: 'Postline', body: 'Notifications are on. New mail will pop up here.', data: { kind: 'test' } }]); }
+      return { res: { registered: 1 } };
+    }
+    case 'pushtest': await sendPush([{ title: 'Postline', body: 'Notifications are working ✓', data: { kind: 'test' } }]); return { res: { sent: Object.keys(S.push).length } };
     case 'suggest': {
       if (!mail.suggest) throw new Error('This backend has no directory search');
       const rows = await mail.suggest(String(op.q || '').slice(0, 40));
@@ -131,7 +190,12 @@ async function processOps() {
   for (const op of ops) {
     let rec2;
     try { const r = await execute(op); rec2 = { ok: true, ts: Date.now(), res: r.res }; if (r.mail) mail = true; if (r.want) want.push(...r.want); log('op ok', op.t, op.id); }
-    catch (e) { rec2 = { ok: false, err: String(e.message).slice(0, 160), ts: Date.now() }; log('op FAILED', op.t, op.id, e.message); }
+    catch (e) {
+      const transient = /browser has been closed|context or browser|Target page, context|Timeout|Navigation|net::|crash/i.test(e.message);
+      S.tries = S.tries || {}; S.tries[op.id] = (S.tries[op.id] || 0) + 1;
+      if (transient && S.tries[op.id] < 4) { log('op will retry', op.t, op.id, '(' + S.tries[op.id] + ')', String(e.message).split('\n')[0].slice(0, 80)); save(); await sleep(3000); continue; }
+      rec2 = { ok: false, err: String(e.message).split('\n')[0].slice(0, 160), ts: Date.now() }; log('op FAILED', op.t, op.id, String(e.message).split('\n')[0]);
+    }
     S.done[op.id] = rec2; save();
   }
   const cutoff = Date.now() - 3 * 86400000;
@@ -191,12 +255,19 @@ async function tick(force) {
     log('ERROR', e.message);
     if (/browser has been closed|context or browser|Target page, context|Browser closed|crashed/i.test(e.message)) { log('Chrome is gone - exiting so the watchdog restarts the bridge'); process.exit(4); }
     if (e.fatal) { log('Google refused the saved login — run: node bridge/auth.mjs'); process.exit(2); }
-  } finally { publishing = false; }
+  } finally { publishing = false; lastTickDone = Date.now(); }
 }
 
 await startBackend();
+// hang guard: if no work cycle has finished for 4 minutes the browser is stuck - say where, then exit so the loop starts a fresh one
+if (!ONCE) setInterval(async () => {
+  const idle = Date.now() - Math.max(lastTickDone, (mail._progress && mail._progress()) || 0); // no finished cycle AND no browser activity
+  if (idle <= 4 * 60000) return;
+  let where = ''; try { where = mail._where ? mail._where() : ''; } catch { /* ignore */ }
+  log('stuck for 4 minutes (' + where + ') - restarting'); process.exit(4);
+}, 20000);
+if (!ONCE) setInterval(() => { publishState().catch((e) => log('heartbeat', e.message)); }, 30000); // alive signal independent of slow syncs
 log(`Postline bridge (${mail.name}) starting for ${account} -> ${cfg.ck.container} (${cfg.ck.environment})`);
 await tick(true);
-if (!ONCE) setInterval(() => { publishState().catch((e) => log('heartbeat', e.message)); }, 30000); // alive signal independent of slow syncs
 if (!ONCE) crawlLoop();
 if (!ONCE) { for (;;) { await sleep(5000); await tick(pendingForce); pendingForce = false; } }

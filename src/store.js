@@ -1,12 +1,30 @@
 // Mail state: talks to iCloud, keeps a local cache (so the app opens instantly and works offline), queues requests.
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { AppState } from 'react-native';
+import { AppState, Platform } from 'react-native';
+import * as Notifications from 'expo-notifications';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Haptics from 'expo-haptics';
 import { SEED } from './seed';
 import { appendOps, readList, readState, readThread, readSearch, readGlobal, canUse } from './cloudcore';
 import { uid } from './util';
 import * as demo from './demo';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+if (Platform.OS !== 'web') {
+  Notifications.setNotificationHandler({ handleNotification: async () => ({ shouldShowBanner: true, shouldShowList: true, shouldShowAlert: true, shouldPlaySound: true, shouldSetBadge: false }) });
+}
+/** What the notification library would send to Expo's server to register this device, captured instead of sent: on a Wi-Fi that only
+ *  allows Apple that server is unreachable, so the PC (which can reach it) makes the registration on the device's behalf. */
+async function captureExpoRegistration() {
+  const real = global.fetch;
+  let body = null;
+  global.fetch = (url, init) => {
+    if (String((url && url.url) || url).includes('push/getExpoPushToken')) { body = init && init.body ? String(init.body) : null; return Promise.reject(new Error('kept for the PC')); }
+    return real(url, init);
+  };
+  try { await Promise.race([Notifications.getExpoPushTokenAsync(), sleep(15000)]); } catch { /* expected: the request was kept */ } finally { global.fetch = real; }
+  try { const j = JSON.parse(body); return j && j.deviceToken && j.deviceId ? j : null; } catch { return null; }
+}
 
 const Ctx = createContext(null);
 export const useMail = () => useContext(Ctx);
@@ -35,7 +53,7 @@ export function MailProvider({ children }) {
   // ---- load cache
   useEffect(() => { if (demo.isDemo()) { setList(demo.list); setStatus(demo.status); setContacts(demo.contacts); return; } (async () => {
     const [l, v, p, f, s, ct] = await Promise.all([jget(K.list, []), jget(K.ver, 0), jget(K.pend, []), jget(K.failed, []), jget(K.status, null), jget(K.contacts, { ver: 0, items: [] })]);
-    R.current.ver = v; R.current.cver = ct.ver || 0; setContacts(ct.items || []); setList(l); setPending(p); setFailed(f); setStatus(s);
+    R.current.ver = v; R.current.cver = ct.ver || 0; setContacts(ct.items || []); setFailed((f0) => f0.filter((x) => Date.now() - (x.op.ts || 0) < 1800000)); setList(l); setPending(p); setFailed(f); setStatus(s);
   })(); }, []);
   useEffect(() => { jset(K.pend, pending); }, [pending]);
   useEffect(() => { jset(K.failed, failed); }, [failed]);
@@ -50,6 +68,7 @@ export function MailProvider({ children }) {
     await appendOps(R.current.cfg, todo.map((p) => p.op), Object.keys(R.current.handled));
     const ids = new Set(todo.map((p) => p.op.id));
     setPending((cur) => cur.map((p) => (ids.has(p.op.id) ? { ...p, sent: true } : p)));
+    setSends((cur) => cur.map((s) => (ids.has(s.id) && s.status === 'sending' ? { ...s, status: 'queued' } : s)));
   }, []);
 
   const refresh = useCallback(async () => {
@@ -71,7 +90,7 @@ export function MailProvider({ children }) {
         }
         // requests the bridge has answered
         const h = st.handled || {};
-        setSends((cur) => cur.map((s) => (s.status === 'sending' && h[s.id] ? { ...s, status: h[s.id].ok ? 'sent' : 'failed', err: h[s.id].err } : s)));
+        setSends((cur) => cur.map((s) => ((s.status === 'sending' || s.status === 'queued') && h[s.id] ? { ...s, status: h[s.id].ok ? 'sent' : 'failed', err: h[s.id].err } : s)));
         const done = R.current.pending.filter((p) => h[p.op.id]);
         if (done.length) {
           setPending((cur) => cur.filter((p) => !h[p.op.id]));
@@ -149,6 +168,23 @@ export function MailProvider({ children }) {
     }
     return null;
   }, [enqueue]);
+
+  // ---- notifications: ask permission, get this device's push address (through the PC when Expo is unreachable), tell the PC
+  useEffect(() => {
+    if (Platform.OS === 'web' || !cfg || demo.isDemo()) return;
+    (async () => {
+      try {
+        const p = await Notifications.requestPermissionsAsync();
+        if (!p.granted) return;
+        let token = await jget('pl.pushToken', '');
+        try { token = (await Promise.race([Notifications.getExpoPushTokenAsync(), sleep(8000).then(() => { throw new Error('no answer'); })])).data || token; jset('pl.pushToken', token); } catch { /* that server is blocked here */ }
+        const last = await jget('pl.pushAt', 0);
+        if (token) { if ((await jget('pl.pushReg', '')) !== token || Date.now() - last > 6 * 3600000) { enqueue({ t: 'push', token }); jset('pl.pushReg', token); jset('pl.pushAt', Date.now()); } return; }
+        const reg = await captureExpoRegistration();
+        if (reg && (reg.deviceToken !== (await jget('pl.pushRelay', '')) || Date.now() - last > 6 * 3600000)) { enqueue({ t: 'pushreg', body: reg }); jset('pl.pushRelay', reg.deviceToken); jset('pl.pushAt', Date.now()); }
+      } catch { /* notifications stay off */ }
+    })();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---- people: instant local matches; "search the directory" asks the PC for fresh suggestions and merges them in
   const suggestRemote = useCallback(async (q) => {

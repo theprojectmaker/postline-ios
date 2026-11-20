@@ -12,7 +12,12 @@
       "bundleIdentifier": "com.solyapps.postline",
       "supportsTablet": true,
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "UIBackgroundModes": [
+          "remote-notification"
+        ],
+        "UIStatusBarHidden": true,
+        "UIViewControllerBasedStatusBarAppearance": false
       }
     },
     "web": {
@@ -20,7 +25,8 @@
       "backgroundColor": "#FFFFFF"
     },
     "plugins": [
-      "expo-font"
+      "expo-font",
+      "expo-notifications"
     ],
     "splash": {
       "backgroundColor": "#E0305F",
@@ -28,7 +34,7 @@
       "resizeMode": "contain"
     },
     "owner": "solomonsasson",
-    "runtimeVersion": "shell-1",
+    "runtimeVersion": "shell-2",
     "updates": {
       "url": "https://u.expo.dev/21d149c3-60cd-45cc-8ee1-1275ff65ff35",
       "checkAutomatically": "ON_LOAD",
