@@ -23,6 +23,22 @@ export function listDate(ms) {
 }
 export const fullDate = (ms) => { const d = new Date(ms); return `${MON[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()} at ${t12(d)}`; };
 
+// The text after the last comma in a recipients field (what is being typed right now).
+export const lastToken = (s = '') => s.slice(s.lastIndexOf(',') + 1).trim();
+export const replaceLastToken = (s, entry) => { const i = s.lastIndexOf(','); return (i < 0 ? '' : s.slice(0, i + 1) + ' ') + entry + ', '; };
+/** People whose name words or address start with q, most-used first. */
+export function matchContacts(contacts, q, limit = 6, skip = []) {
+  const n = q.trim().toLowerCase(); if (n.length < 1) return [];
+  const have = new Set(skip.map((x) => parseAddr(x).email.toLowerCase()));
+  const out = [];
+  for (const c of contacts) {
+    if (have.has(c.e)) continue;
+    const words = (c.n + ' ' + c.e.split('@')[0]).toLowerCase().split(/[\s._,'-]+/);
+    const hit = words.some((w) => w.startsWith(n)) || (c.n + ' ' + c.e).toLowerCase().startsWith(n) || (n.includes(' ') && c.n.toLowerCase().includes(n));
+    if (hit) { out.push(c); if (out.length >= limit) break; }
+  }
+  return out;
+}
 export const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 export const rePrefix = (s = '') => (/^re:/i.test(s) ? s : 'Re: ' + s);
 export const fwdPrefix = (s = '') => (/^fwd?:/i.test(s) ? s : 'Fwd: ' + s);

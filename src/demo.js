@@ -17,3 +17,5 @@ export const thread = (id) => {
     { id: id + '3', from: s.from, to: 'you@gmail.com', cc: 'team@example.com', subject: s.subject, date: s.date, labels: ['INBOX', 'UNREAD'], snippet: s.snippet, text: s.snippet + '\n\nBest,\nThe team', html: '', atts: s.att ? [{ name: 'rubric.pdf', size: 84211, type: 'application/pdf' }] : [] },
   ] };
 };
+
+export const contacts = [['Dylan Samadi','dsamadi1'],['Dana Levi','dlevi2'],['Joseph Golan','jgolan1'],['Joseph Sulimani','jsulimani1'],['Ms. Rivera','rivera'],['Priya Shah','priya']].map(([n,u]) => ({ e: u + '@student.gn.k12.ny.us', n, c: 1 }));

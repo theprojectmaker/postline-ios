@@ -22,7 +22,20 @@ async function startBackend() {
   account = (mail.account || '').toLowerCase();
 }
 
+// ---- people directory: addresses seen in mail + the school directory crawled through Gmail's suggestions
+const addrRe = /"?([^",<>;]*?)"?s*<([^<>s]+@[^<>s]+)>|([w.+-]+@[w-]+(?:.[w-]+)+)/g;
+function harvest(text) {
+  let n = 0; if (!text) return n;
+  for (const m of String(text).matchAll(addrRe)) {
+    const email = (m[2] || m[3] || '').toLowerCase().replace(/[.,;]+$/, ''); if (!email || /noreply|no-reply|donotreply|mailer-daemon/.test(email)) continue;
+    const name = (m[1] || '').trim(); const c = S.contacts[email] || (S.contacts[email] = { n: '', c: 0 });
+    if (name && name.toLowerCase() !== email && (!c.n || name.length > c.n.length || /^[a-z]/.test(c.n))) c.n = name;
+    c.c++; n++; S.cdirty = 1;
+  }
+  return n;
+}
 const S = (() => { try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; } })();
+S.contacts ||= {}; S.crawl ||= { q: 'abcdefghijklmnopqrstuvwxyz'.split(''), done: 0 }; S.cver ||= 0; S.cparts ||= 0;
 S.threads ||= {}; S.sums ||= {}; S.done ||= {}; S.ver ||= 0; S.parts ||= 0; S.written ||= {};
 const save = () => fs.writeFileSync(STATE_FILE, JSON.stringify(S));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -36,6 +49,7 @@ async function pool(items, n, fn) {
 async function detailRecord(id) {
   for (const o of [{}, { maxText: 15000, maxHtml: 0 }, { maxText: 4000, maxHtml: 0 }, { maxText: 500, maxHtml: 0 }]) {
     const { summary, detail } = await mail.fetchThread(id, o);
+    if (o.maxText === undefined) detail.msgs.forEach((m) => harvest([m.from, m.to, m.cc].filter(Boolean).join(', ')));
     const json = ck.pack(detail);
     if (json.length < 900000 || o.maxText === 500) return { summary, item: { name: `pl-t-${id}`, json, ver: Date.now() } };
   }
@@ -44,7 +58,7 @@ async function detailRecord(id) {
 let publishing = false, pendingForce = false, lastPublish = 0, info = { unread: 0 };
 async function publishState(extra = {}) {
   const handled = Object.fromEntries(Object.entries(S.done).sort((a, b) => b[1].ts - a[1].ts).slice(0, 100).map(([k, v]) => [k, { ok: v.ok, err: v.err, ts: v.ts, ...(v.res || {}) }]));
-  const body = { ts: Date.now(), online: true, account, ver: S.ver, parts: S.parts, unread: info.unread, handled, ...extra };
+  const body = { ts: Date.now(), online: true, account, ver: S.ver, parts: S.parts, cver: S.cver, cparts: S.cparts, ccount: Object.keys(S.contacts).length, crawlLeft: S.crawl.q.length, unread: info.unread, handled, ...extra };
   await ck.save([{ name: 'pl-state', json: ck.pack(body), ver: Date.now() }]);
   lastPublish = Date.now();
 }
@@ -62,6 +76,7 @@ async function sync(wanted = []) {
     if (mail.summaryOf && !wanted.includes(id) && !S.written[id] && rankOf(id) >= cfg.prewarm && mail.summaryOf(id)) { S.sums[id] = mail.summaryOf(id); S.threads[id] = h; touched = true; return; } // list line is enough until it is opened
     let r; try { r = await detailRecord(id); } catch (e) { if (/404|not found/i.test(e.message)) { delete S.sums[id]; touched = true; return; } throw e; }
     const { summary, item } = r;
+    harvest(summary.from);
     S.sums[id] = summary; S.threads[id] = summary.h; touched = true;
     if (wanted.includes(id) || S.written[id] || rankOf(id) < cfg.prewarm) { writes.push(item); S.written[id] = 1; }
   });
@@ -81,6 +96,13 @@ async function sync(wanted = []) {
 
 async function execute(op) {
   switch (op.t) {
+    case 'suggest': {
+      if (!mail.suggest) throw new Error('This backend has no directory search');
+      const rows = await mail.suggest(String(op.q || '').slice(0, 40));
+      rows.forEach((r) => { const c = S.contacts[r.e.toLowerCase()] || (S.contacts[r.e.toLowerCase()] = { n: '', c: 0 }); if (r.n) c.n = r.n; c.c++; S.cdirty = 1; });
+      await ck.save([{ name: `pl-g-${op.id}`, json: ck.pack(rows.map((r) => ({ e: r.e.toLowerCase(), n: r.n }))), ver: Date.now() }]);
+      return { res: { n: rows.length } };
+    }
     case 'send': {
       if (!String(op.to || '').trim()) throw new Error('No recipient');
       return { res: await mail.send(op), mail: true };
@@ -118,16 +140,47 @@ async function processOps() {
   return { mail, want };
 }
 
+// Writes the contact list when it changed (parts like the mailbox list). Sorted so frequent contacts come first.
+async function publishContacts() {
+  if (!S.cdirty) return; S.cdirty = 0;
+  const list = Object.entries(S.contacts).map(([e, v]) => ({ e, n: v.n || '', c: v.c })).sort((a, b) => b.c - a.c);
+  const json = ck.pack(list), ver = Date.now(), parts = Math.max(1, Math.ceil(json.length / PART));
+  await ck.save(Array.from({ length: parts }, (_, i) => ({ name: `pl-contacts-${i}`, json: json.slice(i * PART, (i + 1) * PART), ver })));
+  S.cver = ver; S.cparts = parts; save(); await publishState();
+  log(`contacts: ${list.length} published`);
+}
+
+// Background crawl of the school directory: every 2-letter-and-longer prefix that fills Gmail's suggestion list is split further.
+async function crawlLoop() {
+  if (!mail.suggest) return;
+  let lastPub = 0;
+  for (;;) {
+    await sleep(3000);
+    if (fs.existsSync(path.join(here, 'PAUSE'))) continue;
+    const q = S.crawl.q.shift();
+    if (!q) { await sleep(60000); if (S.cdirty) await publishContacts().catch(() => {}); continue; }
+    try {
+      const rows = await mail.suggest(q);
+      for (const r of rows) { const e = r.e.toLowerCase(); const c = S.contacts[e] || (S.contacts[e] = { n: '', c: 0 }); if (r.n) c.n = r.n; S.cdirty = 1; }
+      if (rows.length >= 8 && q.length < 4) for (const ch of 'abcdefghijklmnopqrstuvwxyz') S.crawl.q.push(q + ch);
+      S.crawl.done++;
+      if (S.crawl.done % 25 === 0) save();
+      if (S.cdirty && Date.now() - lastPub > 90000) { lastPub = Date.now(); await publishContacts(); }
+    } catch (e) { S.crawl.q.unshift(q); log('crawl error', e.message); if (/browser has been closed|context or browser|Target page, context/i.test(e.message)) process.exit(4); await sleep(20000); }
+  }
+}
+
 async function tick(force) {
   if (fs.existsSync(path.join(here, 'PAUSE'))) return; // kill switch: create a file named PAUSE in bridge/
   if (publishing) { pendingForce ||= force; return; }
   publishing = true;
   try {
     const { mail, want } = await processOps();
-    if (force || mail || want.length || Date.now() - (S.lastSync || 0) > 25000) { await sync(want); S.lastSync = Date.now(); save(); }
+    if (force || mail || want.length || Date.now() - (S.lastSync || 0) > 12000) { await sync(want); S.lastSync = Date.now(); save(); }
     if (Date.now() - lastPublish > 40000) await publishState(); // heartbeat so the app can tell the PC is alive
   } catch (e) {
     log('ERROR', e.message);
+    if (/browser has been closed|context or browser|Target page, context|Browser closed|crashed/i.test(e.message)) { log('Chrome is gone - exiting so the watchdog restarts the bridge'); process.exit(4); }
     if (e.fatal) { log('Google refused the saved login — run: node bridge/auth.mjs'); process.exit(2); }
   } finally { publishing = false; }
 }
@@ -135,4 +188,6 @@ async function tick(force) {
 await startBackend();
 log(`Postline bridge (${mail.name}) starting for ${account} -> ${cfg.ck.container} (${cfg.ck.environment})`);
 await tick(true);
+if (!ONCE) setInterval(() => { publishState().catch((e) => log('heartbeat', e.message)); }, 30000); // alive signal independent of slow syncs
+if (!ONCE) crawlLoop();
 if (!ONCE) { for (;;) { await sleep(5000); await tick(pendingForce); pendingForce = false; } }

@@ -4,7 +4,7 @@ import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Haptics from 'expo-haptics';
 import { SEED } from './seed';
-import { appendOps, readList, readState, readThread, readSearch, canUse } from './cloudcore';
+import { appendOps, readList, readState, readThread, readSearch, readGlobal, canUse } from './cloudcore';
 import { uid } from './util';
 import * as demo from './demo';
 
@@ -12,7 +12,7 @@ const Ctx = createContext(null);
 export const useMail = () => useContext(Ctx);
 
 export const cfgFromSeed = () => { try { const s = SEED ? JSON.parse(SEED) : null; return s && s.container ? s : null; } catch { return null; } };
-const K = { list: 'pl.list', ver: 'pl.ver', pend: 'pl.pending', failed: 'pl.failed', status: 'pl.status', th: 'pl.th.' , ths: 'pl.thidx' };
+const K = { contacts: 'pl.contacts', list: 'pl.list', ver: 'pl.ver', pend: 'pl.pending', failed: 'pl.failed', status: 'pl.status', th: 'pl.th.' , ths: 'pl.thidx' };
 const jget = async (k, d) => { try { const v = await AsyncStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } };
 const jset = (k, v) => AsyncStorage.setItem(k, JSON.stringify(v)).catch(() => {});
 const ago = (ms) => Date.now() - (ms || 0);
@@ -24,16 +24,18 @@ export function MailProvider({ children }) {
   const [net, setNet] = useState({ ok: true, err: '', at: 0, busy: false }); // can this device reach iCloud?
   const [pending, setPending] = useState([]);       // requests not yet acknowledged by the bridge [{op, sent}]
   const [failed, setFailed] = useState([]);         // requests the bridge refused [{op, err}]
+  const [contacts, setContacts] = useState([]);   // people directory [{e,n,c}] for recipient suggestions
+  const [sends, setSends] = useState([]);          // messages being sent [{id,to,status:'sending'|'sent'|'failed',err}]
   const [over, setOver] = useState({});             // optimistic overrides {threadId: {unread?,flags?,gone?}}
-  const R = useRef({ ver: 0, pending: [], failed: [], busy: false, cfg, handled: {} });
+  const R = useRef({ cver: 0, ver: 0, pending: [], failed: [], busy: false, cfg, handled: {} });
   R.current.pending = pending; R.current.failed = failed;
   const threads = useRef({});                        // conversation cache {id: detail}
   const [, bump] = useState(0);
 
   // ---- load cache
-  useEffect(() => { if (demo.isDemo()) { setList(demo.list); setStatus(demo.status); return; } (async () => {
-    const [l, v, p, f, s] = await Promise.all([jget(K.list, []), jget(K.ver, 0), jget(K.pend, []), jget(K.failed, []), jget(K.status, null)]);
-    R.current.ver = v; setList(l); setPending(p); setFailed(f); setStatus(s);
+  useEffect(() => { if (demo.isDemo()) { setList(demo.list); setStatus(demo.status); setContacts(demo.contacts); return; } (async () => {
+    const [l, v, p, f, s, ct] = await Promise.all([jget(K.list, []), jget(K.ver, 0), jget(K.pend, []), jget(K.failed, []), jget(K.status, null), jget(K.contacts, { ver: 0, items: [] })]);
+    R.current.ver = v; R.current.cver = ct.ver || 0; setContacts(ct.items || []); setList(l); setPending(p); setFailed(f); setStatus(s);
   })(); }, []);
   useEffect(() => { jset(K.pend, pending); }, [pending]);
   useEffect(() => { jset(K.failed, failed); }, [failed]);
@@ -64,8 +66,12 @@ export function MailProvider({ children }) {
           const { items, ver } = await readList(c.cfg, 'pl-list', st.parts);
           c.ver = ver; setList(items); jset(K.list, items); jset(K.ver, ver); setOver({});
         }
+        if (st.cver && st.cver !== c.cver) { // the people directory changed
+          try { const { items, ver } = await readList(c.cfg, 'pl-contacts', st.cparts); c.cver = ver; setContacts(items); jset(K.contacts, { ver, items }); } catch { /* try next round */ }
+        }
         // requests the bridge has answered
         const h = st.handled || {};
+        setSends((cur) => cur.map((s) => (s.status === 'sending' && h[s.id] ? { ...s, status: h[s.id].ok ? 'sent' : 'failed', err: h[s.id].err } : s)));
         const done = R.current.pending.filter((p) => h[p.op.id]);
         if (done.length) {
           setPending((cur) => cur.filter((p) => !h[p.op.id]));
@@ -103,7 +109,7 @@ export function MailProvider({ children }) {
     archive: (id) => enqueue({ t: 'archive', th: id }, { id, patch: { gone: 'archive' } }),
     trash: (id) => enqueue({ t: 'trash', th: id }, { id, patch: { gone: 'trash' } }),
     star: (id, on) => enqueue({ t: 'star', th: id, on }, { id, patch: { star: on } }),
-    send: (m) => enqueue({ t: 'send', ...m }),
+    send: (m) => { const id = enqueue({ t: 'send', ...m }); setSends((c) => [...c, { id, to: m.to, status: 'sending' }]); return id; },
     syncNow: () => enqueue({ t: 'refresh' }),
   }), [enqueue]);
 
@@ -144,6 +150,19 @@ export function MailProvider({ children }) {
     return null;
   }, [enqueue]);
 
+  // ---- people: instant local matches; "search the directory" asks the PC for fresh suggestions and merges them in
+  const suggestRemote = useCallback(async (q) => {
+    const id = enqueue({ t: 'suggest', q });
+    for (let i = 0; i < 14; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      try {
+        const rows = await readGlobal(R.current.cfg, id);
+        if (rows) { setContacts((cur) => { const m = new Map(cur.map((x) => [x.e, x])); rows.forEach((r) => m.set(r.e, { ...(m.get(r.e) || { c: 0 }), ...r })); const out = [...m.values()]; jset(K.contacts, { ver: R.current.cver, items: out }); return out; }); return rows; }
+      } catch { /* retry */ }
+    }
+    return null;
+  }, [enqueue]);
+
   // ---- derived view of the list (optimistic overrides applied)
   const visible = useMemo(() => list.map((t) => {
     const o = over[t.id]; if (!o) return t;
@@ -153,7 +172,7 @@ export function MailProvider({ children }) {
   }).filter((t) => !t.trashed), [list, over]);
 
   const online = demo.isDemo() || !!(status && ago(status.ts) < 150000);
-  const value = { cfg: cfg || (demo.isDemo() ? { demo: 1 } : null), list: visible, status, net, online, pending, failed, dismissFailed: (id) => setFailed((c) => c.filter((f) => f.op.id !== id)),
+  const value = { contacts, suggestRemote, sends, clearSend: (id) => setSends((c) => c.filter((s) => s.id !== id)), cfg: cfg || (demo.isDemo() ? { demo: 1 } : null), list: visible, status, net, online, pending, failed, dismissFailed: (id) => setFailed((c) => c.filter((f) => f.op.id !== id)),
     retryFailed: (f) => { setFailed((c) => c.filter((x) => x.op.id !== f.op.id)); { const { id, ts, ...rest } = f.op; enqueue(rest); }; },
     refresh, act, loadThread, search, bump: () => bump((x) => x + 1) };
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

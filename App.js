@@ -5,7 +5,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import * as Updates from 'expo-updates';
 import { AppState } from 'react-native';
 import { MailProvider } from './src/store';
-import { Banner, BOXES, Compose, Conversation, Mailboxes, ThreadList } from './src/views';
+import { Banner, BOXES, Compose, Conversation, Mailboxes, SendPopup, ThreadList } from './src/views';
 import { T, WIDE, SIDEBAR, LISTW, hair } from './src/theme';
 
 function Shell() {
@@ -38,6 +38,7 @@ function Shell() {
           <View style={{ flex: 1 }}>{conv}</View>
         </View>
       ) : openId ? conv : screen === 'boxes' ? <Mailboxes box={box} setBox={pickBox} wide={false} /> : list}
+      <SendPopup />
       {draft && <Compose key={JSON.stringify(draft).length + (draft.threadId || '')} draft={draft} onClose={() => setDraft(null)} />}
     </View>
   );

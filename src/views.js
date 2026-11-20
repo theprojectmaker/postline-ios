@@ -1,12 +1,12 @@
 // Mail screens: mailbox sidebar, thread list, conversation, compose sheet, status banner.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Alert, Animated, Easing, FlatList, KeyboardAvoidingView, Modal, Platform, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { WebView } from 'react-native-webview';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import { T, hair, avatarColor } from './theme';
-import { fullDate, fwdPrefix, initial, listDate, looksEmail, parseAddr, quoteFor, rePrefix, senderName, validEmails } from './util';
+import { fullDate, fwdPrefix, initial, lastToken, listDate, looksEmail, matchContacts, parseAddr, quoteFor, replaceLastToken, rePrefix, senderName, validEmails } from './util';
 import { useMail } from './store';
 
 export const BOXES = [
@@ -34,8 +34,6 @@ export function Banner() {
   else if (!net.ok && net.at) rows.push({ k: 'net', c: T.amber, t: 'Can’t reach iCloud right now. Showing saved mail.' });
   else if (status && !online) rows.push({ k: 'pc', c: T.amber, t: 'Your computer’s Postline bridge is offline. New mail is paused; anything you send will go out when it’s back.' });
   else if (!status && net.at && net.ok) rows.push({ k: 'wait', c: T.amber, t: 'Waiting for the Postline bridge on your computer to publish your mail.' });
-  const sending = pending.filter((p) => p.op.t === 'send').length;
-  if (sending) rows.push({ k: 'send', c: T.tint, t: sending === 1 ? 'Sending 1 message…' : `Sending ${sending} messages…` });
   failed.forEach((f) => rows.push({ k: f.op.id, c: T.red, t: `${f.op.t === 'send' ? 'Message to ' + (f.op.to || '').slice(0, 30) : 'A change'} failed: ${f.err}`, f }));
   if (!rows.length) return null;
   return (
@@ -271,16 +269,66 @@ export function Conversation({ id, onBack, onCompose, wide, onGone }) {
   );
 }
 
+// ---------- "Sending…" pop-up: spins while the message travels, flips to a check when Gmail has sent it
+export function SendPopup() {
+  const { sends, clearSend } = useMail();
+  const cur = sends[sends.length - 1];
+  const pop = useRef(new Animated.Value(0)).current;
+  const spin = useRef(new Animated.Value(0)).current;
+  const status = cur && cur.status;
+  const curId = cur && cur.id;
+  useEffect(() => {
+    if (!curId) { pop.setValue(0); return; }
+    Animated.spring(pop, { toValue: 1, useNativeDriver: true, friction: 7, tension: 90 }).start();
+  }, [curId]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (status !== 'sending') return undefined;
+    const loop = Animated.loop(Animated.timing(spin, { toValue: 1, duration: 900, easing: Easing.linear, useNativeDriver: true }));
+    loop.start();
+    return () => loop.stop();
+  }, [status]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!curId || status === 'sending') return undefined;
+    if (status === 'sent') Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+    const t = setTimeout(() => Animated.timing(pop, { toValue: 0, duration: 220, useNativeDriver: true }).start(() => clearSend(curId)), status === 'sent' ? 1600 : 3200);
+    return () => clearTimeout(t);
+  }, [status, curId]); // eslint-disable-line react-hooks/exhaustive-deps
+  if (!cur) return null;
+  const rot = spin.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '360deg'] });
+  const who = (cur.to || '').split(',')[0].replace(/<.*>/, '').trim();
+  return (
+    <View pointerEvents="none" style={st.popWrap}>
+      <Animated.View style={[st.pop, { opacity: pop, transform: [{ scale: pop.interpolate({ inputRange: [0, 1], outputRange: [0.85, 1] }) }] }]}>
+        {status === 'sending' ? <Animated.View style={{ transform: [{ rotate: rot }] }}><Ionicons name="sync" size={34} color={T.tint} /></Animated.View>
+          : status === 'sent' ? <Ionicons name="checkmark-circle" size={40} color={T.green} /> : <Ionicons name="close-circle" size={40} color={T.red} />}
+        <Text style={st.popTitle}>{status === 'sending' ? 'Sending…' : status === 'sent' ? 'Sent' : 'Couldn’t send'}</Text>
+        <Text style={st.popSub} numberOfLines={2}>{status === 'failed' ? (cur.err || 'Tap Retry in the banner.') : who ? 'To ' + who : ''}</Text>
+      </Animated.View>
+    </View>
+  );
+}
+
 // ---------- compose
 export function Compose({ draft, onClose }) {
-  const { act } = useMail();
+  const { act, contacts, suggestRemote } = useMail();
   const ins = useSafeAreaInsets();
+  const [focus, setFocus] = useState('to');
+  const [dirBusy, setDirBusy] = useState('');
   const [to, setTo] = useState(draft.to || '');
   const [cc, setCc] = useState(draft.cc || '');
   const [subject, setSubject] = useState(draft.subject || '');
   const [body, setBody] = useState(draft.body || '');
   const [showCc, setShowCc] = useState(!!draft.cc);
   const bodyRef = useRef(null);
+  const field = focus === 'cc' ? cc : to;
+  const token = lastToken(field);
+  const picks = useMemo(() => matchContacts(contacts, token, 6, [...validEmails(to), ...validEmails(cc)]), [contacts, token, to, cc]);
+  const choose = (c) => {
+    const entry = c.n ? `${c.n.replace(/[<>,"]/g, '')} <${c.e}>` : c.e;
+    Haptics.selectionAsync().catch(() => {});
+    (focus === 'cc' ? setCc : setTo)((v) => replaceLastToken(v, entry));
+  };
+  const askDirectory = async () => { const q = token; setDirBusy(q); try { await suggestRemote(q); } finally { setDirBusy(''); } };
   const send = () => {
     const tos = validEmails(to), ccs = validEmails(cc);
     if (!tos.length) return Alert.alert('Add a recipient', 'Type an email address in To.');
@@ -299,9 +347,30 @@ export function Compose({ draft, onClose }) {
           <Pressable onPress={send} hitSlop={8} style={st.sendBtn}><Ionicons name="arrow-up" size={20} color="#fff" /></Pressable>
         </View>
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingBottom: ins.bottom + 40 }}>
-          <Field label="To"><TextInput value={to} onChangeText={setTo} autoFocus={!draft.to} keyboardType="email-address" autoCapitalize="none" autoCorrect={false} style={st.input} placeholder="name@example.com" placeholderTextColor={T.faint} /></Field>
-          {showCc ? <Field label="Cc"><TextInput value={cc} onChangeText={setCc} keyboardType="email-address" autoCapitalize="none" autoCorrect={false} style={st.input} /></Field>
+          <Field label="To"><TextInput value={to} onChangeText={setTo} onFocus={() => setFocus('to')} autoFocus={!draft.to} keyboardType="email-address" autoCapitalize="none" autoCorrect={false} style={st.input} placeholder="name@example.com" placeholderTextColor={T.faint} /></Field>
+          {showCc ? <Field label="Cc"><TextInput value={cc} onChangeText={setCc} onFocus={() => setFocus('cc')} keyboardType="email-address" autoCapitalize="none" autoCorrect={false} style={st.input} /></Field>
             : <Pressable onPress={() => setShowCc(true)} style={st.field}><Text style={st.fieldL}>Cc</Text><Text style={{ color: T.faint, fontSize: 16 }}>Add Cc</Text></Pressable>}
+          {token.length >= 1 && (
+            <View style={st.picks}>
+              {picks.map((c) => (
+                <Pressable key={c.e} onPress={() => choose(c)} style={({ pressed }) => [st.pick, pressed && { backgroundColor: T.group }]}>
+                  <View style={[st.pickAv, { backgroundColor: avatarColor(c.e) }]}><Text style={st.avatarT}>{initial(c.n || c.e)}</Text></View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={st.pickName} numberOfLines={1}>{c.n || c.e.split('@')[0]}</Text>
+                    <Text style={st.pickMail} numberOfLines={1}>{c.e}</Text>
+                  </View>
+                </Pressable>
+              ))}
+              {token.length >= 2 && (
+                <Pressable onPress={askDirectory} disabled={!!dirBusy} style={st.pick}>
+                  {dirBusy === token ? <ActivityIndicator style={{ width: 32 }} /> : <Ionicons name="search" size={20} color={T.tint} style={{ width: 32, textAlign: 'center' }} />}
+                  <Text style={{ color: T.tint, fontSize: 15, flex: 1 }}>
+                    {dirBusy === token ? 'Searching the school directory…' : `${picks.length ? 'Search' : 'No match yet. Search'} the school directory for “${token}”`}
+                  </Text>
+                </Pressable>
+              )}
+            </View>
+          )}
           <Field label="Subject"><TextInput value={subject} onChangeText={setSubject} style={st.input} /></Field>
           <TextInput ref={bodyRef} value={body} onChangeText={setBody} multiline autoFocus={!!draft.to} textAlignVertical="top" style={st.compBody} placeholder="Message" placeholderTextColor={T.faint} />
         </ScrollView>
@@ -312,6 +381,15 @@ export function Compose({ draft, onClose }) {
 const Field = ({ label, children }) => <View style={st.field}><Text style={st.fieldL}>{label}</Text><View style={{ flex: 1 }}>{children}</View></View>;
 
 const st = StyleSheet.create({
+  popWrap: { ...StyleSheet.absoluteFillObject, alignItems: 'center', justifyContent: 'center', zIndex: 50 },
+  pop: { minWidth: 190, maxWidth: 300, paddingVertical: 22, paddingHorizontal: 26, borderRadius: 22, backgroundColor: '#FFFFFFF2', alignItems: 'center', gap: 6, shadowColor: '#000', shadowOpacity: 0.22, shadowRadius: 24, shadowOffset: { width: 0, height: 8 }, elevation: 12, borderWidth: hair, borderColor: T.line },
+  popTitle: { fontSize: 20, fontWeight: '700', color: T.ink, marginTop: 4 },
+  popSub: { fontSize: 14, color: T.sub, textAlign: 'center' },
+  picks: { borderBottomWidth: hair, borderBottomColor: T.line, backgroundColor: '#FAFAFC' },
+  pick: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 16, paddingVertical: 8 },
+  pickAv: { width: 32, height: 32, borderRadius: 16, alignItems: 'center', justifyContent: 'center' },
+  pickName: { fontSize: 16, color: T.ink, fontWeight: '500' },
+  pickMail: { fontSize: 13, color: T.sub },
   banner: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 14, paddingVertical: 9 },
   bannerText: { flex: 1, fontSize: 13 }, bannerBtn: { color: T.tint, fontWeight: '600', fontSize: 14, marginRight: 8 },
   bigTitle: { fontSize: 34, fontWeight: '700', color: T.ink }, acct: { color: T.sub, fontSize: 14, marginTop: 2 },

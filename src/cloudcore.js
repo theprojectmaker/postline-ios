@@ -94,6 +94,12 @@ export async function readThread(cfg, id) {
   return { ...unseal(cfg.k, rec.fields.json.value), _ver: Number(rec.fields.updatedAt && rec.fields.updatedAt.value) || 0 };
 }
 
+/** A directory-suggestion answer the bridge wrote for request `id` (null until it exists). */
+export async function readGlobal(cfg, id) {
+  const [rec] = await lookup(cfg, [`pl-g-${id}`], 30000);
+  return rec && rec.fields && rec.fields.json ? unseal(cfg.k, rec.fields.json.value) : null;
+}
+
 /** A Gmail search result the bridge wrote for request `id` (null until it exists). */
 export async function readSearch(cfg, id) {
   const [rec] = await lookup(cfg, [`pl-s-${id}`], 30000);
