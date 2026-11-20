@@ -109,7 +109,7 @@ export function MailProvider({ children }) {
 
   useEffect(() => {
     refresh();
-    const t = setInterval(() => { if (AppState.currentState === 'active') refresh(); }, 7000);
+    const t = setInterval(() => { if (AppState.currentState === 'active') refresh(); }, 3500);
     const sub = AppState.addEventListener('change', (s) => { if (s === 'active') refresh(); });
     return () => { clearInterval(t); sub.remove(); };
   }, [refresh]);

@@ -67,7 +67,9 @@ async function publishState(extra = {}) {
 
 /** Gmail -> CloudKit. Fetches only threads whose historyId changed. */
 async function sync(wanted = []) {
+  const T0 = Date.now();
   const ids = await mail.listIds();
+  const tList = Date.now() - T0;
   for (const w of wanted) if (!ids.has(w)) ids.set(w, '');
   const changed = [...ids.entries()].filter(([id, h]) => wanted.includes(id) || !S.threads[id] || S.threads[id] !== h);
   const removed = Object.keys(S.sums).filter((id) => !ids.has(id));
@@ -104,6 +106,7 @@ async function sync(wanted = []) {
   info.unread = await mail.unread();
   await notifyNew();
   save(); await publishState();
+  log(`timing: lists ${Math.round(tList / 1000)}s, conversations ${fetchedNow} in ${Math.round((Date.now() - T0 - tList) / 1000)}s`);
   log(`sync: ${changed.length} changed, ${removed.length} removed, ${writes.length} conversations written, ${list.length} in list`);
   return changed.length;
 }
@@ -221,6 +224,7 @@ async function crawlLoop() {
   const worker = async () => {
     for (;;) {
       await sleep(250);
+      if (publishing) { await sleep(1500); continue; } // mail work always goes first
       if (fs.existsSync(path.join(here, 'PAUSE'))) { await sleep(5000); continue; }
       const q = S.crawl.q.shift();
       if (!q) {
@@ -241,6 +245,46 @@ async function crawlLoop() {
     }
   };
   await Promise.all([worker(), worker(), worker()]);
+}
+
+// ---- live inbox: notice new mail within seconds, publish the list line at once and push-notify (full conversations follow on the next sync)
+let listChain = Promise.resolve();
+async function publishListNow() {
+  const run = listChain.then(async () => {
+    const list = Object.values(S.sums).sort((a, b) => b.date - a.date);
+    const json = ck.pack(list), ver = Date.now(), parts = Math.max(1, Math.ceil(json.length / PART));
+    await ck.save(Array.from({ length: parts }, (_, i) => ({ name: `pl-list-${i}`, json: json.slice(i * PART, (i + 1) * PART), ver })));
+    S.ver = ver; S.parts = parts; save(); await publishState();
+  });
+  listChain = run.catch(() => {});
+  return run;
+}
+async function watchLoop() {
+  if (!mail.watch) return;
+  let last = null;
+  for (;;) {
+    await sleep(1200);
+    if (fs.existsSync(path.join(here, 'PAUSE'))) { await sleep(5000); continue; }
+    try {
+      const rows = await mail.watch();
+      if (!rows.length) continue;
+      const sig = rows.map((r) => r.id + ':' + r.h).join('|');
+      if (last !== null && sig !== last) {
+        let changed = 0;
+        for (const r of rows) {
+          const prev = S.sums[r.id];
+          if (prev && prev.h === r.h) continue;
+          S.sums[r.id] = { ...(prev || {}), ...r, flags: [...new Set([...(r.flags || []), ...((prev && prev.flags) || [])])], n: Math.max(r.n || 1, (prev && prev.n) || 1) };
+          harvest(r.from); changed++;
+        }
+        if (changed) { info.unread = rows.filter((r) => r.unread).length; await notifyNew(); await publishListNow(); log(`live: ${changed} inbox change(s) published`); }
+      }
+      last = sig;
+    } catch (e) {
+      if (/browser has been closed|context or browser|Target page, context/i.test(e.message)) { log('Chrome is gone - exiting'); process.exit(4); }
+      log('watch', String(e.message).split('\n')[0].slice(0, 100)); await sleep(8000);
+    }
+  }
 }
 
 async function tick(force) {
@@ -269,5 +313,6 @@ if (!ONCE) setInterval(async () => {
 if (!ONCE) setInterval(() => { publishState().catch((e) => log('heartbeat', e.message)); }, 30000); // alive signal independent of slow syncs
 log(`Postline bridge (${mail.name}) starting for ${account} -> ${cfg.ck.container} (${cfg.ck.environment})`);
 await tick(true);
-if (!ONCE) crawlLoop();
+if (!ONCE && cfg.crawl) crawlLoop(); // the directory crawl is heavy: off unless config.json says "crawl": true
+if (!ONCE) watchLoop();
 if (!ONCE) { for (;;) { await sleep(5000); await tick(pendingForce); pendingForce = false; } }

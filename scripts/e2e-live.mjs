@@ -12,8 +12,8 @@ const st0 = await app.readState(cfg);
 const stamp = new Date().toISOString().slice(11, 19), subject = `Postline live test ${stamp}`, id = 'live-' + Date.now().toString(36), t0 = Date.now();
 await app.appendOps(cfg, [{ id, t: 'send', ts: Date.now(), to: st0.account, subject, body: `Live test ${stamp} (sent from the app code path, received through the bridge).` }]);
 let sentAt = 0, seenAt = 0, thread = null;
-for (let i = 0; i < 90 && !seenAt; i++) {
-  await sleep(5000);
+for (let i = 0; i < 300 && !seenAt; i++) {
+  await sleep(1500);
   const st = await app.readState(cfg);
   if (!sentAt && st.handled[id]) { sentAt = Date.now() - t0; console.log(`sent by Gmail after ${Math.round(sentAt / 1000)}s ->`, JSON.stringify(st.handled[id])); if (!st.handled[id].ok) process.exit(1); }
   const { items } = await app.readList(cfg, 'pl-list', st.parts);

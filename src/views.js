@@ -283,15 +283,15 @@ export function SendPopup() {
     Animated.spring(pop, { toValue: 1, useNativeDriver: true, friction: 7, tension: 90 }).start();
   }, [curId]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
-    if (status !== 'sending') return undefined;
+    if (status !== 'sending' && status !== 'queued') return undefined;
     const loop = Animated.loop(Animated.timing(spin, { toValue: 1, duration: 900, easing: Easing.linear, useNativeDriver: true }));
     loop.start();
     return () => loop.stop();
   }, [status]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
-    if (!curId || status === 'sending') return undefined;
-    if (status === 'sent' || (status === 'queued' && online)) Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
-    const t = setTimeout(() => Animated.timing(pop, { toValue: 0, duration: 220, useNativeDriver: true }).start(() => clearSend(curId)), status === 'failed' || (status === 'queued' && !online) ? 3600 : 1500);
+    if (!curId || status === 'sending' || status === 'queued') return undefined;
+    if (status === 'sent') Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+    const t = setTimeout(() => Animated.timing(pop, { toValue: 0, duration: 220, useNativeDriver: true }).start(() => clearSend(curId)), status === 'failed' ? 4000 : 1600);
     return () => clearTimeout(t);
   }, [status, curId]); // eslint-disable-line react-hooks/exhaustive-deps
   if (!cur) return null;
@@ -301,11 +301,10 @@ export function SendPopup() {
     <Modal transparent visible animationType="none" statusBarTranslucent supportedOrientations={['portrait', 'landscape']}>
     <View pointerEvents="none" style={st.popWrap}>
       <Animated.View style={[st.pop, { opacity: pop, transform: [{ scale: pop.interpolate({ inputRange: [0, 1], outputRange: [0.85, 1] }) }] }]}>
-        {status === 'sending' ? <Animated.View style={{ transform: [{ rotate: rot }] }}><Ionicons name="sync" size={34} color={T.tint} /></Animated.View>
-          : status === 'sent' || (status === 'queued' && online) ? <Ionicons name="checkmark-circle" size={40} color={T.green} />
-            : status === 'queued' ? <Ionicons name="time" size={40} color={T.amber} /> : <Ionicons name="close-circle" size={40} color={T.red} />}
-        <Text style={st.popTitle}>{status === 'sending' ? 'Sending…' : status === 'sent' || (status === 'queued' && online) ? 'Sent' : status === 'queued' ? 'Queued' : 'Couldn’t send'}</Text>
-        <Text style={st.popSub} numberOfLines={2}>{status === 'failed' ? (cur.err || 'Tap Retry in the banner.') : status === 'queued' && !online ? 'Will go out when your PC is back' : who ? 'To ' + who : ''}</Text>
+        {status === 'sending' || status === 'queued' ? <Animated.View style={{ transform: [{ rotate: rot }] }}><Ionicons name="sync" size={34} color={T.tint} /></Animated.View>
+          : status === 'sent' ? <Ionicons name="checkmark-circle" size={40} color={T.green} /> : <Ionicons name="close-circle" size={40} color={T.red} />}
+        <Text style={st.popTitle}>{status === 'sending' || status === 'queued' ? 'Sending…' : status === 'sent' ? 'Sent' : 'Couldn’t send'}</Text>
+        <Text style={st.popSub} numberOfLines={2}>{status === 'failed' ? (cur.err || 'Tap Retry in the banner.') : status === 'queued' && !online ? 'Waiting for your PC…' : who ? 'To ' + who : ''}</Text>
       </Animated.View>
     </View>
     </Modal>

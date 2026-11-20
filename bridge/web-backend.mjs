@@ -36,7 +36,7 @@ export async function makeWebBackend(cfg, log = console.log) {
     at('goto ' + hash.slice(0, 30));
     await page.goto(BASE + hash, { waitUntil: 'domcontentloaded' });
     if (isLogin(page.url())) throw Object.assign(new Error('Not signed in to Gmail — run bridge\\login-gmail.cmd, sign in, close the window'), { fatal: true });
-    await page.waitForSelector(waitFor, { timeout: 30000 }).catch(() => {});
+    await page.waitForSelector(waitFor.split(', ').map((x) => x + ':visible').join(', '), { timeout: 15000 }).catch(() => {});
     if (isLogin(page.url())) throw Object.assign(new Error('Not signed in to Gmail — run bridge\\login-gmail.cmd'), { fatal: true });
     await sleep(600);
   }
@@ -45,15 +45,22 @@ export async function makeWebBackend(cfg, log = console.log) {
   const HASH = { inbox: '#search/in%3Ainbox', sent: '#sent', starred: '#starred' };
   const TITLES = { inbox: /^(Search results|Inbox)/i, sent: /^Sent/i, starred: /^Starred/i };
   async function waitView(slug) {
-    for (let i = 0; i < 40; i++) { if (TITLES[slug] ? TITLES[slug].test(await page.title()) : i > 6) break; await sleep(250); }
-    await sleep(1200);
+    if (slug !== 'inbox') for (let i = 0; i < 16; i++) { if (TITLES[slug] ? TITLES[slug].test(await page.title()) : i > 6) break; await sleep(250); }
+    // the list DOM fills in gradually (slowly while other tabs are busy): wait until the number of visible rows stops changing
+    let prev = -1;
+    for (let i = 0; i < 24; i++) {
+      await sleep(400);
+      const n = await page.evaluate(() => [...document.querySelectorAll('tr.zA')].filter((t) => t.offsetParent !== null).length).catch(() => 0);
+      if (n > 0 && n === prev && i >= 2) break;
+      prev = n;
+    }
+    await sleep(300);
   }
 
   // ---- list rows -> summaries (also the change signature)
   const rows = new Map(); // id -> summary from the latest list view
-  async function readRows(max) {
-    at('readRows');
-    const raw = await page.evaluate(() => [...document.querySelectorAll('tr.zA')].filter((tr) => tr.offsetParent !== null).map((tr) => {
+  async function readRowsOn(p, max) {
+    const raw = await p.evaluate(() => [...document.querySelectorAll('tr.zA')].filter((tr) => tr.offsetParent !== null).map((tr) => {
       const idEl = tr.querySelector('[data-legacy-thread-id]');
       const nameEl = tr.querySelector('.yW span[email], .yP, .zF');
       const dateEl = tr.querySelector('td.xW span[title], td.xW span');
@@ -73,6 +80,7 @@ export async function makeWebBackend(cfg, log = console.log) {
     }));
     return raw.filter((r) => r.id).slice(0, max);
   }
+  const readRows = (max) => { at('readRows'); return readRowsOn(page, max); };
   const rowToSummary = (r, flag) => {
     const date = Date.parse(r.date.replace(/ | /g, ' ')) || Date.now();
     const sig = [r.snippet, r.unread, r.star, r.date, r.count].join('|');
@@ -80,17 +88,22 @@ export async function makeWebBackend(cfg, log = console.log) {
       unread: r.unread, n: Number(r.count) || 1, flags: [flag, ...(r.star ? ['star'] : [])], att: r.att };
   };
   const BOXES = [['inbox', 'inbox', 'inbox'], ['sent', 'sent', 'sent'], ['starred', 'starred', 'star']];
-  let unreadCount = 0;
+  let unreadCount = 0, lastInbox = 0;
 
   // Opens a conversation by clicking its row in whichever list shows it (a direct URL does not open multi-message threads).
+  const DBG = !!process.env.PL_DEBUG; let L0 = Date.now(); const lap = (l) => { if (DBG) console.log('    +' + String(Date.now() - L0).padStart(6) + 'ms', l); };
   async function openThread(id) {
-    at('openThread');
+    at('openThread'); L0 = Date.now();
     for (const slug of ['inbox', 'sent', 'starred']) {
       if ((await page.evaluate(() => location.hash).catch(() => '')) !== HASH[slug]) { await go(HASH[slug]); await waitView(slug); }
       const row = page.locator(`tr.zA:visible:has([data-legacy-thread-id="${id}"])`).first();
+      lap('list ' + slug + ' ready');
       if (await row.count()) {
-        await row.scrollIntoViewIfNeeded().catch(() => {});
+        lap('row found');
+        await row.scrollIntoViewIfNeeded({ timeout: 2500 }).catch(() => {});
+        lap('scrolled');
         await row.click({ position: { x: 300, y: 12 }, timeout: 8000 });
+        lap('clicked');
         return true;
       }
     }
@@ -105,14 +118,17 @@ export async function makeWebBackend(cfg, log = console.log) {
     const before = await sigOf().catch(() => '');
     if (!(await openThread(id))) throw new Error('Thread not found');
     for (let i = 0; i < 24; i++) { const now = await sigOf().catch(() => ''); if (now !== before && /|/.test(now) && now.split('|')[0]) break; await sleep(250); } // wait for THIS thread to replace the previous one
+    lap('thread view replaced previous');
     await sleep(400);
     // open every collapsed message
     for (let i = 0; i < 3; i++) {
-      const btn = page.locator('[aria-label="Expand all"], span.aJ6, div.kQ, div.kv').first();
+      const btn = page.locator('[aria-label="Expand all"]:visible, span.aJ6:visible, div.kQ:visible, div.kv:visible').first();
       if (await btn.count() === 0) break;
-      await btn.click({ timeout: 2000 }).catch(() => {}); await sleep(300);
+      await btn.click({ timeout: 1500 }).catch(() => {}); await sleep(250);
     }
+    lap('expanded');
     const me = await accountEmail();
+    lap('account');
     const data = await page.evaluate(() => {
       const v = (e) => e.offsetParent !== null;
       const subject = ([...document.querySelectorAll('h2.hP')].find(v) || {}).innerText || '';
@@ -126,6 +142,7 @@ export async function makeWebBackend(cfg, log = console.log) {
       });
       return { subject, msgs };
     });
+    lap('evaluated');
     return { subject: data.subject, msgs: data.msgs, me };
   }
   async function accountEmail() {
@@ -228,6 +245,24 @@ export async function makeWebBackend(cfg, log = console.log) {
     await to.fill('');
     return rows.filter((r) => r.e && r.e.includes('@'));
   }
+  // ---- live watcher: its own tab parked on the whole inbox; Gmail's Refresh button is pressed every couple of seconds and the rows read
+  // straight away, so a new message is noticed in about 2-4 seconds without touching the busy main tab
+  let watchPage = null;
+  async function ensureWatch() {
+    if (watchPage && !watchPage.isClosed()) return watchPage;
+    watchPage = await ctx.newPage(); watchPage.setDefaultTimeout(15000);
+    await watchPage.goto(BASE + HASH.inbox, { waitUntil: 'domcontentloaded' });
+    if (isLogin(watchPage.url())) throw Object.assign(new Error('Not signed in to Gmail'), { fatal: true });
+    await watchPage.waitForSelector('tr.zA', { timeout: 30000 }).catch(() => {});
+    return watchPage;
+  }
+  async function watchOnce() {
+    const p = await ensureWatch();
+    if (!/search\/in%3Ainbox$/.test(await p.evaluate(() => location.hash).catch(() => ''))) { await p.goto(BASE + HASH.inbox, { waitUntil: 'domcontentloaded' }); await sleep(2500); }
+    await p.locator('div[role="button"][aria-label="Refresh"]:visible, div[role="button"][data-tooltip="Refresh"]:visible').first().click({ timeout: 4000 }).catch(() => {});
+    await sleep(1100);
+    return (await readRowsOn(p, Math.min(50, cfg.inboxMax))).map((r) => rowToSummary(r, 'inbox'));
+  }
   const ownPart = (b) => String(b || '').split(/\n\nOn .{5,120} wrote:\n/)[0].trimEnd(); // Gmail adds its own quote when replying
 
   return {
@@ -237,8 +272,13 @@ export async function makeWebBackend(cfg, log = console.log) {
       for (const [slug, , flag] of BOXES) {
         await go(HASH[slug]);
         await waitView(slug);
+        let attempt = 0;
         const max = Math.min(50, slug === 'inbox' ? cfg.inboxMax : slug === 'sent' ? cfg.sentMax : cfg.starMax);
-        const rs = await readRows(max);
+        let rs = await readRows(max);
+        // a half-loaded inbox must never be published (it would make real mail vanish): look again, and give up for this cycle if still short
+        while (slug === 'inbox' && rs.length < 5 && (lastInbox >= 20) && attempt < 3) { attempt++; await sleep(3000); await go(HASH[slug]); await waitView(slug); rs = await readRows(max); }
+        if (slug === 'inbox' && rs.length < 5 && lastInbox >= 20) throw new Error('The inbox did not load completely - trying again next cycle');
+        if (slug === 'inbox') lastInbox = rs.length;
         if (slug === 'inbox') unreadCount = rs.filter((r) => r.unread).length;
         for (const r of rs) { const s = rowToSummary(r, flag); const prev = rows.get(r.id); if (prev && !s.flags.includes(prev.flags[0])) s.flags.push(prev.flags[0]); s.flags = [...new Set(s.flags)]; rows.set(r.id, s); if (!ids.has(r.id)) ids.set(r.id, s.h); }
       }
@@ -290,6 +330,7 @@ export async function makeWebBackend(cfg, log = console.log) {
       return (await readRows(25)).map((r) => rowToSummary(r, 'all'));
     }),
     suggest: (q) => dirRun(async (d) => { try { return await suggestOn(d, q); } catch (e) { if (crashed(e)) { d.page = null; return suggestOn(d, q); } throw e; } }),
+    watch: async () => { try { return await watchOnce(); } catch (e) { if (crashed(e)) watchPage = null; throw e; } },
     _progress: () => lastProgress,
     _where: () => `${where}; url=${(() => { try { return page.url().replace(/\/mail\/u\/0\/?/, '/').slice(0, 70); } catch { return '?'; } })()}`,
     close: () => ctx.close(),
