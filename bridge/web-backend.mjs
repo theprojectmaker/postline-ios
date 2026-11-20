@@ -161,14 +161,19 @@ export async function makeWebBackend(cfg, log = console.log) {
     if (confirm) await page.locator(`button:has-text("${confirm}")`).first().click({ timeout: 2000 }).catch(() => {});
   };
 
-  async function compose({ to, cc, subject, body }) {
+  async function compose({ to, cc, bcc, subject, body }) {
     await go('#inbox');
     await page.locator('div[gh="cb"] div[role="button"], div.T-I.T-I-KE.L3').first().click();
     const dlg = page.locator('div[role="dialog"]').last();
     await dlg.waitFor();
     const toBox = dlg.locator('input[aria-label="To recipients"], textarea[name="to"], input[peoplekit-id]').first();
-    await toBox.fill(to); await page.keyboard.press('Enter');
-    if (cc) { await dlg.locator('span[aria-label*="Cc"], .aB.gQ.pE').first().click().catch(() => {}); await dlg.locator('input[aria-label="Cc recipients"], textarea[name="cc"]').first().fill(cc); await page.keyboard.press('Enter'); }
+    if (to) { await toBox.fill(to); await page.keyboard.press('Enter'); }
+    if (cc) { await dlg.locator('span[aria-label^="Add Cc"]').first().click().catch(() => {}); await dlg.locator('input[aria-label="Cc recipients" i], textarea[name="cc"]').first().fill(cc); await page.keyboard.press('Enter'); }
+    if (bcc) {
+      await dlg.locator('span[aria-label^="Add Bcc"]').first().click().catch(() => {});
+      await dlg.locator('input[aria-label="Bcc recipients" i], textarea[name="bcc"]').first().fill(bcc);
+      await page.keyboard.press('Enter');
+    }
     await dlg.locator('input[name="subjectbox"]').fill(subject || '');
     await dlg.locator('div[aria-label="Message Body"], div[role="textbox"][g_editable="true"]').first().fill(body || '');
     return dlg;
@@ -179,18 +184,19 @@ export async function makeWebBackend(cfg, log = console.log) {
     await sleep(1500);
   }
   // ---- people search: Gmail's own recipient suggestions (includes the school directory), on a second tab so mail work is never blocked
-  let dirPage = null, dirQueue = Promise.resolve();
-  const dirRun = (fn) => { const p = dirQueue.then(fn, fn); dirQueue = p.catch(() => {}); return p; };
-  async function ensureDir() {
-    if (dirPage && !dirPage.isClosed()) return dirPage;
-    dirPage = await ctx.newPage(); dirPage.setDefaultTimeout(15000);
-    await dirPage.goto(BASE + '?view=cm&fs=1', { waitUntil: 'domcontentloaded' });
-    if (isLogin(dirPage.url())) throw Object.assign(new Error('Not signed in to Gmail'), { fatal: true });
-    await dirPage.waitForSelector('input[peoplekit-id], textarea[name="to"], input[aria-label="To recipients"]', { timeout: 30000 });
-    return dirPage;
+  // three tabs share the work (each handles one query at a time), so the whole school directory can be crawled quickly
+  const dirs = Array.from({ length: cfg.dirTabs || 3 }, () => ({ page: null, queue: Promise.resolve(), busy: 0 }));
+  const dirRun = (fn) => { const d = dirs.reduce((a, b) => (b.busy < a.busy ? b : a)); d.busy++; const p = d.queue.then(() => fn(d), () => fn(d)); d.queue = p.catch(() => {}).then(() => { d.busy--; }); return p; };
+  async function ensureDir(d) {
+    if (d.page && !d.page.isClosed()) return d.page;
+    d.page = await ctx.newPage(); d.page.setDefaultTimeout(15000);
+    await d.page.goto(BASE + '?view=cm&fs=1', { waitUntil: 'domcontentloaded' });
+    if (isLogin(d.page.url())) throw Object.assign(new Error('Not signed in to Gmail'), { fatal: true });
+    await d.page.waitForSelector('input[peoplekit-id], textarea[name="to"], input[aria-label="To recipients"]', { timeout: 30000 });
+    return d.page;
   }
-  async function suggestOn(q) {
-    const p = await ensureDir();
+  async function suggestOn(d, q) {
+    const p = await ensureDir(d);
     const to = p.locator('input[peoplekit-id], textarea[name="to"], input[aria-label="To recipients"]').first();
     await to.fill(''); await to.pressSequentially(q, { delay: 35 });
     let last = -1, rows = [];
@@ -266,7 +272,7 @@ export async function makeWebBackend(cfg, log = console.log) {
       await sleep(1500);
       return (await readRows(25)).map((r) => rowToSummary(r, 'all'));
     }),
-    suggest: (q) => dirRun(async () => { try { return await suggestOn(q); } catch (e) { if (crashed(e)) { dirPage = null; return suggestOn(q); } throw e; } }),
+    suggest: (q) => dirRun(async (d) => { try { return await suggestOn(d, q); } catch (e) { if (crashed(e)) { d.page = null; return suggestOn(d, q); } throw e; } }),
     close: () => ctx.close(),
     _page: page, _shot: shot,
   };

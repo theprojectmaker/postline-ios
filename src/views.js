@@ -319,22 +319,36 @@ export function Compose({ draft, onClose }) {
   const [subject, setSubject] = useState(draft.subject || '');
   const [body, setBody] = useState(draft.body || '');
   const [showCc, setShowCc] = useState(!!draft.cc);
+  const [bcc, setBcc] = useState('');
+  const [showBcc, setShowBcc] = useState(false);
   const bodyRef = useRef(null);
-  const field = focus === 'cc' ? cc : to;
+  const field = focus === 'bcc' ? bcc : focus === 'cc' ? cc : to;
   const token = lastToken(field);
-  const picks = useMemo(() => matchContacts(contacts, token, 6, [...validEmails(to), ...validEmails(cc)]), [contacts, token, to, cc]);
+  const taken = [...validEmails(to), ...validEmails(cc), ...validEmails(bcc)];
+  const all = useMemo(() => matchContacts(contacts, token, 5000, taken), [contacts, token, to, cc, bcc]); // eslint-disable-line react-hooks/exhaustive-deps
+  const picks = all.slice(0, 6);
   const choose = (c) => {
     const entry = c.n ? `${c.n.replace(/[<>,"]/g, '')} <${c.e}>` : c.e;
     Haptics.selectionAsync().catch(() => {});
-    (focus === 'cc' ? setCc : setTo)((v) => replaceLastToken(v, entry));
+    (focus === 'bcc' ? setBcc : focus === 'cc' ? setCc : setTo)((v) => replaceLastToken(v, entry));
+  };
+  // everyone who matches what is typed, into Bcc (so replies are not sent to the whole list), at most 100 per message
+  const addAll = () => {
+    const group = all.slice(0, 100);
+    setShowBcc(true); setFocus('bcc');
+    setBcc((v) => { const base = v.replace(/[,\s]+$/, ''); return (base ? base + ', ' : '') + group.map((c) => c.e).join(', ') + ', '; });
+    setTo((v) => (lastToken(v) && focus === 'to' ? v.slice(0, v.lastIndexOf(',') + 1) : v));
+    setCc((v) => (lastToken(v) && focus === 'cc' ? v.slice(0, v.lastIndexOf(',') + 1) : v));
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
   };
   const askDirectory = async () => { const q = token; setDirBusy(q); try { await suggestRemote(q); } finally { setDirBusy(''); } };
   const send = () => {
-    const tos = validEmails(to), ccs = validEmails(cc);
-    if (!tos.length) return Alert.alert('Add a recipient', 'Type an email address in To.');
-    const bad = [...tos, ...ccs].find((x) => !looksEmail(x));
+    const tos = validEmails(to), ccs = validEmails(cc), bccs = validEmails(bcc);
+    if (!tos.length && !bccs.length) return Alert.alert('Add a recipient', 'Type an email address in To.');
+    if (tos.length + ccs.length + bccs.length > 100) return Alert.alert('Too many recipients', 'Send to at most 100 people per message (Gmail limits bulk mail).');
+    const bad = [...tos, ...ccs, ...bccs].find((x) => !looksEmail(x));
     if (bad) return Alert.alert('Check the address', `“${bad}” doesn’t look like an email address.`);
-    const go = () => { act.send({ to: tos.join(', '), cc: ccs.join(', '), subject, body, threadId: draft.threadId, inReplyTo: draft.inReplyTo, references: draft.references }); Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {}); onClose(); };
+    const go = () => { act.send({ to: tos.join(', '), cc: ccs.join(', '), bcc: bccs.join(', '), subject, body, threadId: draft.threadId, inReplyTo: draft.inReplyTo, references: draft.references }); Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {}); onClose(); };
     if (!subject.trim() && !draft.threadId) Alert.alert('Send without a subject?', undefined, [{ text: 'Cancel', style: 'cancel' }, { text: 'Send', onPress: go }]); else go();
   };
   const cancel = () => { if (!body.trim() && !to.trim() && !subject.trim()) return onClose(); Alert.alert('Discard this message?', undefined, [{ text: 'Keep editing', style: 'cancel' }, { text: 'Discard', style: 'destructive', onPress: onClose }]); };
@@ -350,6 +364,9 @@ export function Compose({ draft, onClose }) {
           <Field label="To"><TextInput value={to} onChangeText={setTo} onFocus={() => setFocus('to')} autoFocus={!draft.to} keyboardType="email-address" autoCapitalize="none" autoCorrect={false} style={st.input} placeholder="name@example.com" placeholderTextColor={T.faint} /></Field>
           {showCc ? <Field label="Cc"><TextInput value={cc} onChangeText={setCc} onFocus={() => setFocus('cc')} keyboardType="email-address" autoCapitalize="none" autoCorrect={false} style={st.input} /></Field>
             : <Pressable onPress={() => setShowCc(true)} style={st.field}><Text style={st.fieldL}>Cc</Text><Text style={{ color: T.faint, fontSize: 16 }}>Add Cc</Text></Pressable>}
+          {showBcc
+            ? <Field label="Bcc"><TextInput value={bcc} onChangeText={setBcc} onFocus={() => setFocus('bcc')} keyboardType="email-address" autoCapitalize="none" autoCorrect={false} style={st.input} /></Field>
+            : <Pressable onPress={() => { setShowBcc(true); setFocus('bcc'); }} style={st.field}><Text style={st.fieldL}>Bcc</Text><Text style={{ color: T.faint, fontSize: 16 }}>Add Bcc</Text></Pressable>}
           {token.length >= 1 && (
             <View style={st.picks}>
               {picks.map((c) => (
@@ -361,6 +378,12 @@ export function Compose({ draft, onClose }) {
                   </View>
                 </Pressable>
               ))}
+              {token.length >= 2 && all.length >= 2 && (
+                <Pressable onPress={addAll} style={st.pick}>
+                  <Ionicons name="people" size={20} color={T.tint} style={{ width: 32, textAlign: 'center' }} />
+                  <Text style={{ color: T.tint, fontSize: 15, flex: 1 }}>Add all {Math.min(all.length, 100)} matching “{token}” to Bcc{all.length > 100 ? ` (first 100 of ${all.length})` : ''}</Text>
+                </Pressable>
+              )}
               {token.length >= 2 && (
                 <Pressable onPress={askDirectory} disabled={!!dirBusy} style={st.pick}>
                   {dirBusy === token ? <ActivityIndicator style={{ width: 32 }} /> : <Ionicons name="search" size={20} color={T.tint} style={{ width: 32, textAlign: 'center' }} />}

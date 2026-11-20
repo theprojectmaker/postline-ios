@@ -104,7 +104,7 @@ async function execute(op) {
       return { res: { n: rows.length } };
     }
     case 'send': {
-      if (!String(op.to || '').trim()) throw new Error('No recipient');
+      if (!String(op.to || '').trim() && !String(op.bcc || '').trim()) throw new Error('No recipient');
       return { res: await mail.send(op), mail: true };
     }
     case 'mark': await mail.mark(op.th, !!op.read); return { mail: true };
@@ -153,21 +153,30 @@ async function publishContacts() {
 // Background crawl of the school directory: every 2-letter-and-longer prefix that fills Gmail's suggestion list is split further.
 async function crawlLoop() {
   if (!mail.suggest) return;
-  let lastPub = 0;
-  for (;;) {
-    await sleep(3000);
-    if (fs.existsSync(path.join(here, 'PAUSE'))) continue;
-    const q = S.crawl.q.shift();
-    if (!q) { await sleep(60000); if (S.cdirty) await publishContacts().catch(() => {}); continue; }
-    try {
-      const rows = await mail.suggest(q);
-      for (const r of rows) { const e = r.e.toLowerCase(); const c = S.contacts[e] || (S.contacts[e] = { n: '', c: 0 }); if (r.n) c.n = r.n; S.cdirty = 1; }
-      if (rows.length >= 8 && q.length < 4) for (const ch of 'abcdefghijklmnopqrstuvwxyz') S.crawl.q.push(q + ch);
-      S.crawl.done++;
-      if (S.crawl.done % 25 === 0) save();
-      if (S.cdirty && Date.now() - lastPub > 90000) { lastPub = Date.now(); await publishContacts(); }
-    } catch (e) { S.crawl.q.unshift(q); log('crawl error', e.message); if (/browser has been closed|context or browser|Target page, context/i.test(e.message)) process.exit(4); await sleep(20000); }
-  }
+  let lastPub = 0, finished = false;
+  const worker = async () => {
+    for (;;) {
+      await sleep(250);
+      if (fs.existsSync(path.join(here, 'PAUSE'))) { await sleep(5000); continue; }
+      const q = S.crawl.q.shift();
+      if (!q) {
+        if (!finished && S.crawl.done) { finished = true; log(`directory crawl finished: ${Object.keys(S.contacts).length} people`); }
+        await sleep(30000); if (S.cdirty && Date.now() - lastPub > 60000) { lastPub = Date.now(); await publishContacts().catch(() => {}); }
+        continue;
+      }
+      finished = false;
+      try {
+        const rows = await mail.suggest(q);
+        for (const r of rows) { const e = r.e.toLowerCase(); const c = S.contacts[e] || (S.contacts[e] = { n: '', c: 0 }); if (r.n) c.n = r.n; S.cdirty = 1; }
+        // a full suggestion list means more people share this prefix: split it by the next letter (down to 5 letters)
+        if (rows.length >= 8 && q.length < 5) for (const ch of 'abcdefghijklmnopqrstuvwxyz') S.crawl.q.push(q + ch);
+        S.crawl.done++;
+        if (S.crawl.done % 25 === 0) save();
+        if (S.cdirty && Date.now() - lastPub > 60000) { lastPub = Date.now(); await publishContacts(); }
+      } catch (e) { S.crawl.q.unshift(q); log('crawl error', e.message); if (/browser has been closed|context or browser|Target page, context/i.test(e.message)) process.exit(4); await sleep(20000); }
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
 }
 
 async function tick(force) {
