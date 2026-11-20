@@ -121,6 +121,7 @@ async function sendPush(msgs) {
   const j = await res.json().catch(() => ({}));
   (j.data || []).forEach((t, i) => { if (t && t.status === 'error' && /DeviceNotRegistered/.test((t.details || {}).error || '')) delete S.push[tokens[i % tokens.length]]; });
   log(`push: sent ${msgs.length} to ${tokens.length} device(s) -> ${res.status}`);
+  (j.data || []).forEach((t) => { if (t && t.status === 'error') log('push ticket error:', String(t.message || '').slice(0, 160), '|', JSON.stringify(t.details || {}).slice(0, 120)); else if (t) log('push ticket ok'); });
 }
 const nameOf = (s = '') => { const m = String(s).match(/^\s*"?([^"<]*?)"?\s*</); return (m && m[1].trim()) || String(s).split('@')[0] || 'New mail'; };
 async function notifyNew() {
@@ -188,11 +189,11 @@ async function execute(op) {
 async function processOps() {
   const [rec] = await ck.lookup(['pl-inbox']);
   const ops = ((ck.jsonOf(rec) || {}).ops || []).filter((o) => o && o.id && !S.done[o.id]).sort((a, b) => (a.ts || 0) - (b.ts || 0));
-  if (!ops.length) return { mail: false, want: [] };
-  let mail = false; const want = [];
+  if (!ops.length) return { mail: false, want: [], sent: false };
+  let mail = false, sent = false; const want = [];
   for (const op of ops) {
     let rec2;
-    try { const r = await execute(op); rec2 = { ok: true, ts: Date.now(), res: r.res }; if (r.mail) mail = true; if (r.want) want.push(...r.want); log('op ok', op.t, op.id); }
+    try { const r = await execute(op); rec2 = { ok: true, ts: Date.now(), res: r.res }; if (r.mail) mail = true; if (op.t === 'send') sent = true; if (r.want) want.push(...r.want); log('op ok', op.t, op.id); }
     catch (e) {
       const transient = /browser has been closed|context or browser|Target page, context|Timeout|Navigation|net::|crash/i.test(e.message);
       S.tries = S.tries || {}; S.tries[op.id] = (S.tries[op.id] || 0) + 1;
@@ -200,11 +201,12 @@ async function processOps() {
       rec2 = { ok: false, err: String(e.message).split('\n')[0].slice(0, 160), ts: Date.now() }; log('op FAILED', op.t, op.id, String(e.message).split('\n')[0]);
     }
     S.done[op.id] = rec2; save();
+    await publishState().catch(() => {}); // the app's spinner ends as soon as THIS request is done
   }
   const cutoff = Date.now() - 3 * 86400000;
   for (const k of Object.keys(S.done)) if (S.done[k].ts < cutoff) delete S.done[k];
-  save(); await publishState();
-  return { mail, want };
+  save();
+  return { mail, want, sent };
 }
 
 // Writes the contact list when it changed (parts like the mailbox list). Sorted so frequent contacts come first.
@@ -287,12 +289,47 @@ async function watchLoop() {
   }
 }
 
+// ---- requests from the app are handled in their own loop, so a send never waits for a mailbox sync
+let syncNeeded = false, wantQueue = [], opsBusy = false;
+const mergeRows = (rows) => {
+  let changed = 0;
+  for (const r of rows) {
+    const prev = S.sums[r.id];
+    if (prev && prev.h === r.h && (r.flags || []).every((f) => (prev.flags || []).includes(f))) continue;
+    S.sums[r.id] = { ...(prev || {}), ...r, flags: [...new Set([...(r.flags || []), ...((prev && prev.flags) || [])])], n: Math.max(r.n || 1, (prev && prev.n) || 1) };
+    harvest(r.from); changed++;
+  }
+  return changed;
+};
+async function opsLoop() {
+  for (;;) {
+    await sleep(1500);
+    if (opsBusy || fs.existsSync(path.join(here, 'PAUSE'))) continue;
+    opsBusy = true;
+    try {
+      const r = await processOps();
+      if (r.mail) syncNeeded = true;
+      if (r.want && r.want.length) wantQueue.push(...r.want);
+      if (r.sent && mail.quick) {
+        for (let a = 0; a < 4; a++) { // Gmail's Sent list updates a moment after the send: look again until the new message is in it
+          const n = mergeRows(await mail.quick('sent'));
+          if (n) { await publishListNow(); log('live: sent folder refreshed'); break; }
+          await sleep(2500);
+        }
+      }
+    } catch (e) {
+      log('ops loop', String(e.message).split('\n')[0].slice(0, 100));
+      if (/browser has been closed|context or browser|Target page, context/i.test(e.message)) process.exit(4);
+    } finally { opsBusy = false; lastTickDone = Date.now(); }
+  }
+}
+
 async function tick(force) {
   if (fs.existsSync(path.join(here, 'PAUSE'))) return; // kill switch: create a file named PAUSE in bridge/
   if (publishing) { pendingForce ||= force; return; }
   publishing = true;
   try {
-    const { mail, want } = await processOps();
+    const want = wantQueue.splice(0), mail = syncNeeded; syncNeeded = false;
     if (force || mail || want.length || Date.now() - (S.lastSync || 0) > 12000) { await sync(want); S.lastSync = Date.now(); save(); }
     if (Date.now() - lastPublish > 40000) await publishState(); // heartbeat so the app can tell the PC is alive
   } catch (e) {
@@ -315,4 +352,5 @@ log(`Postline bridge (${mail.name}) starting for ${account} -> ${cfg.ck.containe
 await tick(true);
 if (!ONCE && cfg.crawl) crawlLoop(); // the directory crawl is heavy: off unless config.json says "crawl": true
 if (!ONCE) watchLoop();
+if (!ONCE) opsLoop();
 if (!ONCE) { for (;;) { await sleep(5000); await tick(pendingForce); pendingForce = false; } }

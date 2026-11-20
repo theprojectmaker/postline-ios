@@ -256,6 +256,19 @@ export async function makeWebBackend(cfg, log = console.log) {
     await watchPage.waitForSelector('tr.zA', { timeout: 30000 }).catch(() => {});
     return watchPage;
   }
+  let watchQ = Promise.resolve();
+  const watchRun = (fn) => { const p = watchQ.then(fn, fn); watchQ = p.catch(() => {}); return p; };
+  // quick read of another box (Sent) on the watcher tab, then back to the inbox: lets a just-sent message show up in seconds
+  async function quickBoxOnce(slug) {
+    const p = await ensureWatch();
+    await p.goto(BASE + HASH[slug], { waitUntil: 'domcontentloaded' });
+    for (let i = 0; i < 20; i++) { await sleep(300); if (TITLES[slug] && TITLES[slug].test(await p.title().catch(() => ''))) break; }
+    let prev = -1;
+    for (let i = 0; i < 16; i++) { await sleep(350); const n = await p.evaluate(() => [...document.querySelectorAll('tr.zA')].filter((t) => t.offsetParent !== null).length).catch(() => 0); if (n > 0 && n === prev) break; prev = n; }
+    const rows = await readRowsOn(p, 30);
+    await p.goto(BASE + HASH.inbox, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    return rows.map((r) => rowToSummary(r, slug === 'sent' ? 'sent' : slug));
+  }
   async function watchOnce() {
     const p = await ensureWatch();
     if (!/search\/in%3Ainbox$/.test(await p.evaluate(() => location.hash).catch(() => ''))) { await p.goto(BASE + HASH.inbox, { waitUntil: 'domcontentloaded' }); await sleep(2500); }
@@ -330,7 +343,8 @@ export async function makeWebBackend(cfg, log = console.log) {
       return (await readRows(25)).map((r) => rowToSummary(r, 'all'));
     }),
     suggest: (q) => dirRun(async (d) => { try { return await suggestOn(d, q); } catch (e) { if (crashed(e)) { d.page = null; return suggestOn(d, q); } throw e; } }),
-    watch: async () => { try { return await watchOnce(); } catch (e) { if (crashed(e)) watchPage = null; throw e; } },
+    watch: () => watchRun(async () => { try { return await watchOnce(); } catch (e) { if (crashed(e)) watchPage = null; throw e; } }),
+    quick: (slug) => watchRun(async () => { try { return await quickBoxOnce(slug); } catch (e) { if (crashed(e)) watchPage = null; throw e; } }),
     _progress: () => lastProgress,
     _where: () => `${where}; url=${(() => { try { return page.url().replace(/\/mail\/u\/0\/?/, '/').slice(0, 70); } catch { return '?'; } })()}`,
     close: () => ctx.close(),
