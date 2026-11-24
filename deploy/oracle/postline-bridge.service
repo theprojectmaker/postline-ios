@@ -1,0 +1,19 @@
+[Unit]
+Description=Postline cloud standby bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=__USER__
+WorkingDirectory=__HOME__/postline
+ExecStart=__NODE__ bridge/bridge.mjs
+Restart=always
+RestartSec=15
+# 2 = Gmail sign-in expired, 3 = another copy already running: do not loop on those
+RestartPreventExitStatus=2 3
+KillMode=control-group
+StandardOutput=append:__HOME__/postline/bridge/bridge-console.log
+StandardError=append:__HOME__/postline/bridge/bridge-console.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+{
+  "name": "postline-bridge",
+  "private": true,
+  "description": "Postline PC / cloud bridge. Only needed on the cloud standby: npm install here.",
+  "dependencies": { "playwright-core": "1.65.0" }
+}

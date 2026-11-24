@@ -19,7 +19,7 @@ export async function makeWebBackend(cfg, log = console.log) {
   const { chromium } = await loadPlaywright();
   const ctx = await chromium.launchPersistentContext(cfg.profile, {
     channel: 'chrome', headless: cfg.headless !== false, viewport: { width: 1400, height: 1000 }, args: ['--disable-background-mode'],
-    ...(cfg.chromePath ? { executablePath: cfg.chromePath, channel: undefined } : {}),
+    ...(cfg.chromePath ? { executablePath: cfg.chromePath, channel: undefined } : cfg.chromium ? { channel: undefined } : {}), // chromium: Playwright's own build (Linux ARM has no Google Chrome)
   });
   let page = ctx.pages()[0] || await ctx.newPage();
   page.setDefaultTimeout(20000);

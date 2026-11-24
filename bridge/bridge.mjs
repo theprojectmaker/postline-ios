@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { loadConfig, STATE_FILE, here } from './config.mjs';
 import { makeCk, PART } from './ck.mjs';
+import { makeLease, joinParts } from './lease.mjs';
 
 const cfg = loadConfig();
 const ONCE = process.argv.includes('--once');
@@ -13,7 +14,7 @@ const log = (...a) => { const l = `${new Date().toISOString()} ${a.join(' ')}`; 
 if (!fs.existsSync(cfg.ck.pemPath)) { console.error('CloudKit key not found at ' + cfg.ck.pemPath + ' (set ck.pemPath in bridge/config.json)'); process.exit(1); }
 
 // single instance: a second copy would fight over the same Chrome profile
-import('node:net').then(({ default: net }) => net.createServer().on('error', () => { console.error('Another Postline bridge is already running.'); process.exit(3); }).listen(8793, '127.0.0.1')).catch(() => {});
+import('node:net').then(({ default: net }) => net.createServer().on('error', () => { console.error('Another Postline bridge is already running.'); process.exit(3); }).listen(Number(process.env.PL_LOCK_PORT) || 8793, '127.0.0.1')).catch(() => {});
 const ck = makeCk(cfg.ck);
 let mail, account = '';
 async function startBackend() {
@@ -60,7 +61,7 @@ let lastTickDone = Date.now();
 let publishing = false, pendingForce = false, lastPublish = 0, info = { unread: 0 };
 async function publishState(extra = {}) {
   const handled = Object.fromEntries(Object.entries(S.done).sort((a, b) => b[1].ts - a[1].ts).slice(0, 100).map(([k, v]) => [k, { ok: v.ok, err: v.err, ts: v.ts, ...(v.res || {}) }]));
-  const body = { ts: Date.now(), online: true, account, ver: S.ver, parts: S.parts, cver: S.cver, cparts: S.cparts, ccount: Object.keys(S.contacts).length, crawlLeft: S.crawl.q.length, unread: info.unread, handled, ...extra };
+  const body = { ts: Date.now(), online: true, src: cfg.role, account, ver: S.ver, parts: S.parts, cver: S.cver, cparts: S.cparts, ccount: Object.keys(S.contacts).length, crawlLeft: S.crawl.q.length, unread: info.unread, handled, ...extra };
   await ck.save([{ name: 'pl-state', json: ck.pack(body), ver: Date.now() }]);
   lastPublish = Date.now();
 }
@@ -339,6 +340,31 @@ async function tick(force) {
   } finally { publishing = false; lastTickDone = Date.now(); }
 }
 
+// ---- PC / cloud-standby handoff (see lease.mjs): the cloud copy sleeps until the PC has been silent for 90 s
+async function adopt() { // pick up what the other copy learned: handled requests, push tokens, contacts
+  try {
+    const [st, pu] = await ck.lookup(['pl-state', 'pl-push']);
+    const s = ck.jsonOf(st) || {}, p = ck.jsonOf(pu) || {};
+    for (const [id, v] of Object.entries(s.handled || {})) if (!S.done[id]) S.done[id] = { ok: v.ok, err: v.err, ts: v.ts || Date.now() };
+    for (const t of p.tokens || []) if (!S.push[t]) S.push[t] = { at: Date.now() };
+    if (s.cparts) {
+      const recs = await ck.lookup(Array.from({ length: s.cparts }, (_, i) => `pl-contacts-${i}`));
+      for (const c of joinParts(ck, cfg.ck.dataKey, recs)) { const cur = S.contacts[c.e] || (S.contacts[c.e] = { n: '', c: 0 }); if (c.n && !cur.n) cur.n = c.n; cur.c = Math.max(cur.c, c.c); }
+      S.cver = s.cver; S.cparts = s.cparts;
+    }
+    S.pushSince = Math.max(S.pushSince || 0, cfg.role === 'cloud' ? (s.ts || Date.now()) : Date.now()); // cloud: tell about mail that came while the PC was off; PC: the cloud already told
+    save(); log(`adopted: ${Object.keys(S.done).length} handled, ${Object.keys(S.push).length} device(s), ${Object.keys(S.contacts).length} contacts`);
+  } catch (e) { log('adopt failed', String(e.message).slice(0, 100)); }
+}
+let pushSaved = '';
+async function savePushTokens() { const j = JSON.stringify(Object.keys(S.push).sort()); if (j === pushSaved) return; await ck.save([{ name: 'pl-push', json: ck.pack({ tokens: Object.keys(S.push) }), ver: Date.now() }]); pushSaved = j; }
+if (!ONCE) {
+  const lease = makeLease(ck, cfg.role, log);
+  const tookOver = await lease.acquire();
+  if (tookOver) await adopt();
+  lease.keep();
+  setInterval(() => { savePushTokens().catch(() => {}); }, 20000);
+}
 await startBackend();
 // hang guard: if no work cycle has finished for 4 minutes the browser is stuck - say where, then exit so the loop starts a fresh one
 if (!ONCE) setInterval(async () => {
