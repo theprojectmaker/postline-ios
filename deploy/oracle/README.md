@@ -14,9 +14,8 @@ and push tokens + contacts are carried across. The two copies coordinate through
 ```powershell
 node deploy/oracle/pack-secrets.mjs                     # writes ~/Desktop/postline-secrets.tar.gz (keys; keep private)
 scp -i oracle.key $HOME\Desktop\postline-secrets.tar.gz ubuntu@<VM-IP>:~/
-scp -i oracle.key deploy/oracle/setup.sh ubuntu@<VM-IP>:~/
 del $HOME\Desktop\postline-secrets.tar.gz
-ssh -i oracle.key ubuntu@<VM-IP> "bash setup.sh"
+ssh -i oracle.key ubuntu@<VM-IP> "git clone https://github.com/theprojectmaker/postline-ios.git postline && bash postline/deploy/oracle/setup.sh"
 ```
 
 ## 3. Sign in to Gmail once (through an SSH tunnel)
